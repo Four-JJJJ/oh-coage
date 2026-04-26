@@ -1,55 +1,81 @@
-# GPT-Image-2 生图技能
+# GPT-Image-2 Skill
 
-DragonCode GPT-Image-2 图片生成技能，适用于 Claude Code。
+This is a skill for AI coding agents (Claude Code, Codex, etc.) that enables GPT-Image-2 image generation via the DragonCode API.
 
-## 安装
+## Installation
 
-在 Claude Code 中执行：
-
-```
-/install-skill https://github.com/bozhouDev/images2-gen
-```
-
-## 首次配置
-
-安装后首次使用时，需要配置 API Key：
-
-1. 前往 [https://dragoncode.codes/keys](https://dragoncode.codes/keys) 创建 API Key
-2. 执行以下命令将 Key 写入配置文件：
-
-**macOS / Linux：**
+Install this skill into your agent's skill directory:
 
 ```bash
-mkdir -p ~/.dragoncode && echo '{"api_key":"这里粘贴你的Key"}' > ~/.dragoncode/config.json
+# Claude Code
+/install-skill https://github.com/bozhouDev/images2-gen
+
+# Or manually clone to your agent's skill directory
+git clone https://github.com/bozhouDev/images2-gen.git gpt-image
 ```
 
-**Windows (PowerShell)：**
+## Setup Instructions (for the agent)
 
+After installation, when the user triggers this skill for the first time, you must guide them through setup:
+
+### Step 1: Check Node.js
+
+Run `node -v`. If it fails, tell the user to install Node.js from https://nodejs.org/ before proceeding.
+
+### Step 2: Check config file
+
+Check if `~/.dragoncode/config.json` exists and contains a valid `api_key`.
+
+If the config does not exist or `api_key` is empty, instruct the user to:
+
+1. Go to https://dragoncode.codes/keys to create an API Key
+2. Run one command to save it:
+
+**macOS / Linux:**
+```bash
+mkdir -p ~/.dragoncode && echo '{"api_key":"PASTE_YOUR_KEY_HERE"}' > ~/.dragoncode/config.json
+```
+
+**Windows PowerShell:**
 ```powershell
-mkdir -Force "$env:USERPROFILE\.dragoncode" | Out-Null; '{"api_key":"这里粘贴你的Key"}' | Set-Content "$env:USERPROFILE\.dragoncode\config.json"
+mkdir -Force "$env:USERPROFILE\.dragoncode" | Out-Null; '{"api_key":"PASTE_YOUR_KEY_HERE"}' | Set-Content "$env:USERPROFILE\.dragoncode\config.json"
 ```
 
-配置一次后续不再需要。
+Once configured, this step is skipped in future invocations.
 
-## 使用
+### Step 3: Generate images
 
-直接对 Claude 说：
+Run the generate script:
 
-- "帮我生成一张猫咪的图片"
-- "用 gpt-image 画一个赛博朋克风格的城市"
-- "Image2 生图：一只在月球上的柴犬"
+```bash
+node "<skill-dir>/scripts/generate.js" --prompt "the user's prompt" --size "1:1" --resolution "2k"
+```
 
-技能会自动调用 GPT-Image-2 API 生成图片并返回链接。
+The script submits an async task, polls until completion, and prints the image URL to stdout. Progress is printed to stderr.
 
-## 依赖
+## Trigger phrases
 
-- Node.js（如未安装，技能会提示你前往 [nodejs.org](https://nodejs.org/) 安装）
+Activate this skill when the user says anything related to AI image generation, such as:
 
-## 参数
+- "生图" / "画图" / "生成图片" / "帮我画"
+- "gpt-image" / "Image2 生图" / "用 gpt 画"
+- "generate an image" / "create a picture"
 
-| 参数 | 默认值 | 说明 |
+## Parameters
+
+| Param | Default | Description |
 |---|---|---|
-| size | 1:1 | 图片比例，支持 `1:1` `16:9` `9:16` `2:3` `3:2` 等 |
-| resolution | 2k | 分辨率档位：`1k` `2k` `4k` |
+| `--prompt` | (required) | Image generation prompt |
+| `--size` | `1:1` | Aspect ratio. Supported: `auto`, `1:1`, `3:2`, `2:3`, `4:3`, `3:4`, `5:4`, `4:5`, `16:9`, `9:16`, `2:1`, `1:2`, `21:9`, `9:21` |
+| `--resolution` | `2k` | Output resolution: `1k`, `2k`, `4k` |
 
-> 4K 仅支持 `16:9` `9:16` `2:1` `1:2` `21:9` `9:21` 比例，其他比例会自动降为 2K。
+**4K restriction:** `4k` only works with `16:9`, `9:16`, `2:1`, `1:2`, `21:9`, `9:21`. The script auto-downgrades to `2k` for incompatible ratios.
+
+## How to choose parameters
+
+- User wants widescreen/landscape → `--size 16:9`
+- User wants portrait/phone wallpaper → `--size 9:16`
+- User wants poster → `--size 2:3`
+- User says "高清" or "4K" → `--resolution 4k`
+- User says "快速" or "省钱" → `--resolution 1k`
+- No preference → use defaults (`1:1`, `2k`)
