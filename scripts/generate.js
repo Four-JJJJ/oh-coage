@@ -65,16 +65,23 @@ function request(url, options, body) {
 }
 
 /**
- * 提交图片生成任务
+ * 提交图片生成任务（支持文生图和图生图）
  */
-async function submitTask(apiKey, prompt, size, resolution) {
-  const payload = JSON.stringify({
+async function submitTask(apiKey, prompt, size, resolution, imageUrls) {
+  const body = {
     model: 'gpt-image-2',
     prompt,
     n: 1,
     size,
     resolution,
-  });
+  };
+
+  // 图生图：添加参考图片
+  if (imageUrls && imageUrls.length > 0) {
+    body.image_urls = imageUrls;
+  }
+
+  const payload = JSON.stringify(body);
 
   const result = await request(`${BASE_URL}/images/generations`, {
     method: 'POST',
@@ -121,18 +128,19 @@ async function pollTask(apiKey, taskId) {
 // 解析命令行参数
 function parseArgs() {
   const args = process.argv.slice(2);
-  const parsed = { size: '1:1', resolution: '2k' };
+  const parsed = { size: '1:1', resolution: '2k', imageUrls: [] };
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
       case '--prompt': parsed.prompt = args[++i]; break;
       case '--size': parsed.size = args[++i]; break;
       case '--resolution': parsed.resolution = args[++i]; break;
+      case '--image-url': parsed.imageUrls.push(args[++i]); break;
     }
   }
 
   if (!parsed.prompt) {
-    console.error('用法: node generate.js --prompt "提示词" [--size 1:1] [--resolution 2k]');
+    console.error('用法: node generate.js --prompt "提示词" [--size 1:1] [--resolution 2k] [--image-url URL]');
     process.exit(1);
   }
   return parsed;
@@ -142,7 +150,7 @@ function parseArgs() {
 const VALID_4K_SIZES = new Set(['16:9', '9:16', '2:1', '1:2', '21:9', '9:21']);
 
 async function main() {
-  const { prompt, size, resolution } = parseArgs();
+  const { prompt, size, resolution, imageUrls } = parseArgs();
   const apiKey = loadApiKey();
 
   // 4K 比例限制检查
@@ -152,9 +160,13 @@ async function main() {
     finalResolution = '2k';
   }
 
-  process.stderr.write(`正在提交任务: prompt=${prompt}, size=${size}, resolution=${finalResolution}\n`);
+  const mode = imageUrls.length > 0 ? '图生图' : '文生图';
+  process.stderr.write(`正在提交${mode}任务: prompt=${prompt}, size=${size}, resolution=${finalResolution}\n`);
+  if (imageUrls.length > 0) {
+    process.stderr.write(`参考图片: ${imageUrls.length} 张\n`);
+  }
 
-  const taskId = await submitTask(apiKey, prompt, size, finalResolution);
+  const taskId = await submitTask(apiKey, prompt, size, finalResolution, imageUrls);
   process.stderr.write(`任务已提交: ${taskId}\n`);
 
   const imageUrl = await pollTask(apiKey, taskId);

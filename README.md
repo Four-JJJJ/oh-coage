@@ -68,6 +68,7 @@ Activate this skill when the user says anything related to AI image generation, 
 | `--prompt` | (required) | Image generation prompt |
 | `--size` | `1:1` | Aspect ratio. Supported: `auto`, `1:1`, `3:2`, `2:3`, `4:3`, `3:4`, `5:4`, `4:5`, `16:9`, `9:16`, `2:1`, `1:2`, `21:9`, `9:21` |
 | `--resolution` | `2k` | Output resolution: `1k`, `2k`, `4k` |
+| `--image-url` | (none) | Reference image URL for image-to-image generation. Can be passed multiple times (max 16). Supports HTTP URLs and base64 data URIs |
 
 **4K restriction:** `4k` only works with `16:9`, `9:16`, `2:1`, `1:2`, `21:9`, `9:21`. The script auto-downgrades to `2k` for incompatible ratios.
 
@@ -79,3 +80,20 @@ Activate this skill when the user says anything related to AI image generation, 
 - User says "高清" or "4K" → `--resolution 4k`
 - User says "快速" or "省钱" → `--resolution 1k`
 - No preference → use defaults (`1:1`, `2k`)
+
+## Image-to-image (图生图)
+
+When the user provides a reference image (URL, local file, or pasted image) and asks to edit/transform it, use `--image-url`:
+
+```bash
+node "<skill-dir>/scripts/generate.js" \
+  --prompt "turn this into watercolor style" \
+  --image-url "https://example.com/photo.jpg" \
+  --size "1:1" \
+  --resolution "2k"
+```
+
+- Pass `--image-url` multiple times for multiple reference images (max 16)
+- Supports HTTP/HTTPS URLs and base64 data URIs (`data:image/png;base64,...`)
+- If the user provides a local file path, read it and convert to base64 data URI before passing
+- Triggers: "把这张图改成", "参考这张图", "edit this image", "transform this photo", "change the style of"
