@@ -45,6 +45,24 @@ node "$SKILL_DIR/scripts/setup.js" \
 - 本地配置文件只保存 `base_url`、`output_dir`、`keychain_account` 等非敏感字段
 - 不把 key 写进仓库、README、Obsidian、日志或截图
 
+## 依赖缺失处理
+
+如果运行前发现缺少依赖，不要直接替用户安装，先询问用户是否允许补齐，并说明原因。
+
+需要优先检查的依赖：
+
+1. `Node.js`
+2. macOS `security` 命令
+3. Keychain 可用性
+
+建议说明方式：
+
+- 缺少 `Node.js`：此 skill 的 `setup.js` 和 `generate.js` 都依赖 Node.js 执行
+- 缺少 `security`：此 skill 需要把 API Key 安全写入 Keychain，而不是明文写进配置文件
+- Keychain 不可用：后续无法安全读取和切换多个 profile 的 key
+
+只有在用户明确同意后，才继续补依赖或引导安装。
+
 ## 后续生成流程
 
 初始化完成后，直接调用：
@@ -84,6 +102,33 @@ node "$SKILL_DIR/scripts/setup.js" --list
 ```
 
 如果用户想新增一个 profile，重复运行初始化命令，但换一个 `--profile` 名和对应的 `base_url` / `api_key` 即可。
+
+如果用户想删除某个 profile，运行：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --delete-profile "backup"
+```
+
+如果用户想重命名某个 profile，运行：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --rename-profile "old-name" --to "new-name"
+```
+
+如果用户想删除这个 skill 的本地配置和 Keychain 记录，运行：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --uninstall-skill
+```
+
+说明：
+
+- 该命令会删除本地 `state.json`
+- 默认也会删除当前配置文件和相关 Keychain 记录
+- 不会自动删除 skill 仓库目录本身
+- 如果用户要保留配置文件或 Keychain，可加：
+  - `--keep-config-file`
+  - `--keep-keychain`
 
 ## 图生图
 

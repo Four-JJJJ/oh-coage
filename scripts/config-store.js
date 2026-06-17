@@ -10,6 +10,11 @@ const DEFAULT_BASE_URL = 'https://dragoncode.codes/gpt-image/v1';
 const DEFAULT_CONFIG_FILENAME = 'images2-gen-config.json';
 const KEYCHAIN_SERVICE = 'images2-gen';
 
+function commandExists(command) {
+  const result = spawnSync('bash', ['-lc', `command -v ${command}`], { encoding: 'utf-8' });
+  return result.status === 0;
+}
+
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
@@ -77,6 +82,10 @@ function buildKeychainAccount(profileName, configPath) {
 }
 
 function saveKeychainSecret(account, secret) {
+  if (!commandExists('security')) {
+    throw new Error('缺少 macOS Keychain 依赖：未找到 security 命令。请先征求用户同意，再补齐该依赖，因为此 skill 需要用 Keychain 安全存储 API Key。');
+  }
+
   const result = spawnSync('security', ['add-generic-password', '-U', '-a', account, '-s', KEYCHAIN_SERVICE, '-w', secret], {
     encoding: 'utf-8',
   });
@@ -87,6 +96,10 @@ function saveKeychainSecret(account, secret) {
 }
 
 function readKeychainSecret(account) {
+  if (!commandExists('security')) {
+    throw new Error('缺少 macOS Keychain 依赖：未找到 security 命令。请先征求用户同意，再补齐该依赖，因为此 skill 需要从 Keychain 读取 API Key。');
+  }
+
   const result = spawnSync('security', ['find-generic-password', '-a', account, '-s', KEYCHAIN_SERVICE, '-w'], {
     encoding: 'utf-8',
   });
@@ -96,6 +109,26 @@ function readKeychainSecret(account) {
   }
 
   return result.stdout.trim();
+}
+
+function deleteKeychainSecret(account) {
+  if (!commandExists('security')) {
+    throw new Error('缺少 macOS Keychain 依赖：未找到 security 命令。请先征求用户同意，再补齐该依赖，因为此 skill 需要清理 Keychain 中保存的 API Key。');
+  }
+
+  const result = spawnSync('security', ['delete-generic-password', '-a', account, '-s', KEYCHAIN_SERVICE], {
+    encoding: 'utf-8',
+  });
+
+  if (result.status !== 0) {
+    const stderr = (result.stderr || '').trim();
+    if (stderr.includes('could not be found')) {
+      return false;
+    }
+    throw new Error(stderr || `删除 Keychain 记录失败: ${account}`);
+  }
+
+  return true;
 }
 
 function setActiveProfile(config, profileName) {
@@ -126,5 +159,7 @@ module.exports = {
   buildKeychainAccount,
   saveKeychainSecret,
   readKeychainSecret,
+  deleteKeychainSecret,
   setActiveProfile,
+  commandExists,
 };

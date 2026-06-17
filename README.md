@@ -53,6 +53,25 @@ node -v
 
 也就是说，这个版本的“安全存储 key”方案是为 **macOS** 优先设计的。
 
+## 缺少依赖时的处理原则
+
+如果用户机器上缺少依赖，不应直接静默安装。正确做法是：
+
+1. 先告诉用户缺少什么
+2. 再说明为什么必须补这个依赖
+3. 最后询问用户是否允许补齐
+
+建议按下面的理由说明：
+
+- 缺少 `Node.js`
+  - 因为 `setup.js` 和 `generate.js` 都需要 Node.js 执行
+- 缺少 `security`
+  - 因为这个 skill 依赖 macOS Keychain 安全保存 API Key，而不是把 key 明文写进配置文件
+- Keychain 不可用
+  - 因为后续无法安全读取 key，也无法稳妥支持多 profile 切换
+
+只有在用户明确同意后，再继续补依赖或引导安装。
+
 ## 安装方式
 
 把这个仓库作为 skill 安装到你的 agent skills 目录。
@@ -267,6 +286,52 @@ node "$SKILL_DIR/scripts/setup.js" --activate-profile "backup"
 node "$SKILL_DIR/scripts/generate.js" \
   --profile "backup" \
   --prompt "a minimal poster"
+```
+
+### 删除某个 profile
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --delete-profile "backup"
+```
+
+说明：
+
+- 会同时删除这个 profile 对应的 Keychain 记录
+- 如果它是当前 active profile，会自动切到剩余的第一个 profile
+- 如果当前只剩最后一个 profile，脚本会阻止删除，并提示改用 `--uninstall-skill`
+
+### 重命名某个 profile
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --rename-profile "old-name" --to "new-name"
+```
+
+说明：
+
+- 会同步迁移 Keychain 中的 key 到新的 account 名
+- 如果原来是 active profile，重命名后仍然保持 active
+
+### 删除这个 skill 的本地配置
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --uninstall-skill
+```
+
+默认行为：
+
+- 删除 `~/.images2-gen/state.json`
+- 删除当前配置文件
+- 删除所有 profile 对应的 Keychain 记录
+- 不删除 skill 仓库目录本身
+
+如果你只想部分清理：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --uninstall-skill --keep-config-file
+```
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --uninstall-skill --keep-keychain
 ```
 
 ## 比例和分辨率建议
