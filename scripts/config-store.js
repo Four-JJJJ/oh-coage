@@ -6,6 +6,7 @@ const { spawnSync } = require('child_process');
 
 const APP_DIR = path.join(os.homedir(), '.oh-coage');
 const STATE_PATH = path.join(APP_DIR, 'state.json');
+const RUNS_PATH = path.join(APP_DIR, 'runs.jsonl');
 const DEFAULT_BASE_URL = 'https://your-image-site.example/v1';
 const DEFAULT_CONFIG_FILENAME = 'oh-coage-config.json';
 const KEYCHAIN_SERVICE = 'oh-coage';
@@ -40,6 +41,11 @@ function writeJson(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+function appendJsonl(filePath, value) {
+  ensureDir(path.dirname(filePath));
+  fs.appendFileSync(filePath, `${JSON.stringify(value)}\n`);
+}
+
 function loadState() {
   return readJson(STATE_PATH, {});
 }
@@ -59,6 +65,11 @@ function loadConfigFromPath(configPath) {
   }
 
   config.profiles ||= {};
+  for (const profile of Object.values(config.profiles)) {
+    if (profile && !profile.root_output_dir && profile.output_dir) {
+      profile.root_output_dir = profile.output_dir;
+    }
+  }
   return config;
 }
 
@@ -143,6 +154,7 @@ function setActiveProfile(config, profileName) {
 module.exports = {
   APP_DIR,
   STATE_PATH,
+  RUNS_PATH,
   DEFAULT_BASE_URL,
   DEFAULT_CONFIG_FILENAME,
   KEYCHAIN_SERVICE,
@@ -150,6 +162,7 @@ module.exports = {
   normalizeBaseUrl,
   readJson,
   writeJson,
+  appendJsonl,
   loadState,
   saveState,
   getDefaultConfigPath,

@@ -6,6 +6,8 @@
 
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+const http = require('http');
 const {
   APP_DIR,
   STATE_PATH,
@@ -41,6 +43,8 @@ function parseArgs() {
       case '--uninstall-skill': parsed.uninstallSkill = true; break;
       case '--keep-config-file': parsed.keepConfigFile = true; break;
       case '--keep-keychain': parsed.keepKeychain = true; break;
+      case '--health-check': parsed.healthCheck = true; break;
+      case '--live': parsed.live = true; break;
     }
   }
 
@@ -61,6 +65,8 @@ function printUsage() {
   console.error('    node setup.js --rename-profile "old-name" --to "new-name"');
   console.error('  删除 skill 本地配置和 Keychain 记录:');
   console.error('    node setup.js --uninstall-skill [--keep-config-file] [--keep-keychain]');
+  console.error('  profile 健康检查:');
+  console.error('    node setup.js --health-check [--live]');
 }
 
 function requireConfig() {
@@ -81,8 +87,82 @@ function listProfiles() {
   console.log(`config: ${configPath}`);
   Object.entries(config.profiles || {}).forEach(([name, profile]) => {
     const flag = name === config.active_profile ? '*' : ' ';
-    console.log(`${flag} ${name} -> ${profile.base_url} -> ${profile.output_dir}`);
+    console.log(`${flag} ${name} -> ${profile.base_url} -> ${profile.root_output_dir || profile.output_dir}`);
   });
+}
+
+function probeUrl(url, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    const mod = url.startsWith('https') ? https : http;
+    const req = mod.request(url, { method: 'GET' }, (res) => {
+      res.resume();
+      resolve({ reachable: true, statusCode: res.statusCode });
+    });
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Request timed out after ${timeoutMs}ms`));
+    });
+    req.on('error', (error) => resolve({ reachable: false, error: error.message }));
+    req.end();
+  });
+}
+
+async function healthCheck(options) {
+  const { config, configPath } = requireConfig();
+  console.log(`config: ${configPath}`);
+  console.log(`mode: ${options.live ? 'live' : 'local'}`);
+
+  const names = Object.keys(config.profiles || {});
+  if (!names.length) {
+    console.log('没有可检查的 profile。');
+    return;
+  }
+
+  for (const name of names) {
+    const profile = config.profiles[name];
+    const checks = [];
+
+    checks.push({ item: 'enabled', ok: profile.enabled !== false, detail: profile.enabled === false ? 'disabled' : 'enabled' });
+
+    try {
+      const rootOutputDir = profile.root_output_dir || profile.output_dir;
+      ensureDir(rootOutputDir);
+      fs.accessSync(rootOutputDir, fs.constants.W_OK);
+      checks.push({ item: 'root_output_dir', ok: true, detail: rootOutputDir });
+    } catch (error) {
+      checks.push({ item: 'root_output_dir', ok: false, detail: error.message });
+    }
+
+    try {
+      const baseUrl = normalizeBaseUrl(profile.base_url);
+      new URL(baseUrl);
+      checks.push({ item: 'base_url', ok: true, detail: baseUrl });
+
+      if (options.live) {
+        const probe = await probeUrl(baseUrl);
+        checks.push({
+          item: 'live_probe',
+          ok: probe.reachable,
+          detail: probe.reachable ? `reachable (HTTP ${probe.statusCode})` : probe.error,
+        });
+      }
+    } catch (error) {
+      checks.push({ item: 'base_url', ok: false, detail: error.message });
+    }
+
+    try {
+      const key = readKeychainSecret(profile.keychain_account);
+      checks.push({ item: 'keychain', ok: true, detail: `loaded (${key.length} chars)` });
+    } catch (error) {
+      checks.push({ item: 'keychain', ok: false, detail: error.message });
+    }
+
+    const healthy = checks.every((check) => check.ok);
+    const activeFlag = name === config.active_profile ? '*' : ' ';
+    console.log(`${activeFlag} ${name}: ${healthy ? 'ok' : 'needs_attention'}`);
+    checks.forEach((check) => {
+      console.log(`  - ${check.item}: ${check.ok ? 'ok' : 'fail'} (${check.detail})`);
+    });
+  }
 }
 
 function activateProfile(profileName) {
@@ -114,7 +194,7 @@ function upsertProfile(options) {
 
   config.profiles[options.profile] = {
     base_url: normalizeBaseUrl(options.baseUrl),
-    output_dir: options.outputDir,
+    root_output_dir: options.outputDir,
     keychain_account: keychainAccount,
     updated_at: new Date().toISOString(),
   };
@@ -130,7 +210,7 @@ function upsertProfile(options) {
   console.log(`配置已保存: ${configPath}`);
   console.log(`profile: ${options.profile}`);
   console.log(`base_url: ${config.profiles[options.profile].base_url}`);
-  console.log(`output_dir: ${config.profiles[options.profile].output_dir}`);
+  console.log(`root_output_dir: ${config.profiles[options.profile].root_output_dir}`);
   console.log(`active_profile: ${config.active_profile}`);
 }
 
@@ -269,11 +349,18 @@ function main() {
     return;
   }
 
+  if (options.healthCheck) {
+    return healthCheck(options);
+  }
+
   upsertProfile(options);
 }
 
 try {
-  main();
+  Promise.resolve(main()).catch((error) => {
+    console.error(`错误：${error.message}`);
+    process.exit(1);
+  });
 } catch (error) {
   console.error(`错误：${error.message}`);
   process.exit(1);

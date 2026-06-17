@@ -18,6 +18,9 @@
 - 首次使用初始化
 - 默认本地保存图片
 - 多 profile 管理
+- 自动 fallback 到备用 profile
+- 健康检查命令
+- 运行日志记录
 - Keychain 存储密钥
 - 兼容：
   - 同步接口：请求后直接返回图片 URL 或 base64
@@ -158,7 +161,7 @@ node "$SKILL_DIR/scripts/setup.js" \
   "profiles": {
     "main": {
       "base_url": "https://image.example.com/v1",
-      "output_dir": "/Users/you/Pictures/AI",
+      "root_output_dir": "/Users/you/Pictures/AI",
       "keychain_account": "main:abcd1234efgh"
     }
   }
@@ -166,6 +169,8 @@ node "$SKILL_DIR/scripts/setup.js" \
 ```
 
 不会把真实 `api_key` 写进这个文件。
+
+字段语义上，`root_output_dir` 表示图片总目录。每次生成时，脚本会在这个总目录下再自动创建一个时间命名的任务子目录。
 
 ## 日常生成图片
 
@@ -182,9 +187,11 @@ node "$SKILL_DIR/scripts/generate.js" \
 
 - 读取当前 active profile
 - 自动从 Keychain 读取该 profile 的 key
-- 调用该 profile 对应的 `base_url`
+- 优先调用当前 active profile，对可重试错误会自动 fallback 到下一个可用 profile
 - 生成成功后先在该 profile 的总目录下创建一个时间命名子文件夹，再把图片保存进去
 - `stdout` 输出最终本地文件路径
+- 同时会在 `~/.oh-coage/runs.jsonl` 追加一条运行日志
+- 每次任务目录内还会写一个 `meta.json`
 
 ## 图生图
 
@@ -256,6 +263,10 @@ node "$SKILL_DIR/scripts/setup.js" [options]
   - 列出所有 profile
 - `--activate-profile`
   - 切换当前默认 profile
+- `--health-check`
+  - 检查所有 profile 的本地配置健康度
+- `--live`
+  - 与 `--health-check` 配合使用，增加一次低成本在线可达性探测
 
 ## 多 profile 管理
 
@@ -264,6 +275,29 @@ node "$SKILL_DIR/scripts/setup.js" [options]
 ```bash
 node "$SKILL_DIR/scripts/setup.js" --list
 ```
+
+### 健康检查
+
+本地无成本检查：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --health-check
+```
+
+带在线探测的检查：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --health-check --live
+```
+
+默认检查内容：
+
+- profile 是否启用
+- `base_url` 格式是否合法
+- 输出总目录是否可写
+- Keychain 中是否能读到对应 key
+
+加上 `--live` 后，还会额外探测该 `base_url` 是否可达。
 
 ### 新增一个 profile
 
@@ -395,6 +429,57 @@ node "$SKILL_DIR/scripts/generate.js" \
 - 临时测试新站点
 - 临时切换 key
 - 不想改当前默认 profile
+
+## 自动 fallback
+
+生成图片时，脚本会按 profile 顺序尝试。
+
+当前顺序规则：
+
+- 先用当前 active profile
+- 如果指定了 `--profile`，优先从该 profile 开始
+- 其他 profile 作为后续候选
+
+遇到下面这类错误，会自动切到下一个候选 profile：
+
+- `502`
+- `503`
+- `504`
+- `408`
+- `429`
+- 网络超时
+- 连接重置或连接失败
+
+其中：
+
+- `429` 会先在当前 profile 上做短暂退避重试
+- `401` / `403` 会直接判定该 profile 当前不可用
+
+如果你想禁用自动 fallback：
+
+```bash
+node "$SKILL_DIR/scripts/generate.js" \
+  --prompt "a blue mug" \
+  --no-fallback
+```
+
+## 运行日志
+
+每次生成都会写入：
+
+```text
+~/.oh-coage/runs.jsonl
+```
+
+每条日志会记录：
+
+- 开始时间
+- prompt 摘要
+- 使用的 profile
+- 每次尝试的错误码 / 错误类型
+- 最终是否成功
+- 保存路径
+- 总耗时
 
 ## 安全说明
 
