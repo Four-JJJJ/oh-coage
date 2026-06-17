@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * images2-gen 首次初始化和 profile 管理脚本。
+ * oh-coage 首次初始化和 profile 管理脚本。
  * 敏感信息只写入 macOS Keychain，本地配置只保存非敏感字段。
  */
 

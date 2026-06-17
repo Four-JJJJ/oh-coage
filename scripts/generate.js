@@ -19,7 +19,7 @@ const {
 const VALID_4K_SIZES = new Set(['16:9', '9:16', '2:1', '1:2', '21:9', '9:21']);
 
 function printSetupInstructions() {
-  console.error('错误：尚未完成 images2-gen 初始化。');
+  console.error('错误：尚未完成 oh-coage 初始化。');
   console.error('请先让 agent 收集以下信息后运行 setup.js：');
   console.error('1. 图片输出目录');
   console.error('2. profile 名称');
@@ -166,7 +166,7 @@ function buildOutputPath(output, outDir, extension) {
   }
 
   ensureDir(outDir);
-  return path.join(outDir, `gpt-image-${Date.now()}${extension}`);
+  return path.join(outDir, `oh-coage-${Date.now()}${extension}`);
 }
 
 async function downloadToFile(url, filePath) {

@@ -4,11 +4,11 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 
-const APP_DIR = path.join(os.homedir(), '.images2-gen');
+const APP_DIR = path.join(os.homedir(), '.oh-coage');
 const STATE_PATH = path.join(APP_DIR, 'state.json');
-const DEFAULT_BASE_URL = 'https://dragoncode.codes/gpt-image/v1';
-const DEFAULT_CONFIG_FILENAME = 'images2-gen-config.json';
-const KEYCHAIN_SERVICE = 'images2-gen';
+const DEFAULT_BASE_URL = 'https://your-image-site.example/v1';
+const DEFAULT_CONFIG_FILENAME = 'oh-coage-config.json';
+const KEYCHAIN_SERVICE = 'oh-coage';
 
 function commandExists(command) {
   const result = spawnSync('bash', ['-lc', `command -v ${command}`], { encoding: 'utf-8' });

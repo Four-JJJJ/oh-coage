@@ -97,6 +97,7 @@ git clone https://github.com/Four-JJJJ/oh-coage.git
 - 参考这张图……
 - image generate
 - image edit
+- oh-coage
 - gpt-image
 
 ## 首次使用流程
@@ -130,20 +131,20 @@ node "$SKILL_DIR/scripts/setup.js" \
 示例：
 
 ```text
-/Users/you/Pictures/AI/images2-gen-config.json
+/Users/you/Pictures/AI/oh-coage-config.json
 ```
 
 2. 全局状态文件
 
 ```text
-~/.images2-gen/state.json
+~/.oh-coage/state.json
 ```
 
 这个文件只记录“当前配置文件路径”。
 
 3. macOS Keychain 中的密钥
 
-- service: `images2-gen`
+- service: `oh-coage`
 - account: `profile名 + 配置文件路径哈希`
 
 ### 配置文件里保存什么
@@ -319,7 +320,7 @@ node "$SKILL_DIR/scripts/setup.js" --uninstall-skill
 
 默认行为：
 
-- 删除 `~/.images2-gen/state.json`
+- 删除 `~/.oh-coage/state.json`
 - 删除当前配置文件
 - 删除所有 profile 对应的 Keychain 记录
 - 不删除 skill 仓库目录本身
@@ -412,7 +413,7 @@ node "$SKILL_DIR/scripts/generate.js" \
 
 ## 常见问题
 
-### 1. 提示“尚未完成 images2-gen 初始化”
+### 1. 提示“尚未完成 oh-coage 初始化”
 
 说明还没有初始化，先运行：
 
