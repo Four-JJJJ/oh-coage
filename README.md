@@ -125,6 +125,12 @@ node "$SKILL_DIR/scripts/setup.js" \
   --activate
 ```
 
+首次初始化时，macOS 可能会弹出 Keychain 授权窗口。
+
+- 这是正常行为，因为 skill 需要把真实 `API Key` 写入系统 Keychain
+- 用户需要在弹窗里点“允许”
+- 如果点了“拒绝”或直接关闭弹窗，这次初始化会失败；重新执行一次 `setup.js` 即可
+
 ### 初始化完成后会发生什么
 
 会写入 3 类数据：
@@ -521,7 +527,21 @@ node "$SKILL_DIR/scripts/setup.js" \
 
 最直接的修复方式是重新运行一次对应 profile 的 `setup.js`。
 
-### 3. 图片没有保存到预期目录
+### 3. 提示 Keychain 授权被取消或被拒绝
+
+通常是首次初始化时：
+
+- 系统弹出了 Keychain 授权窗口
+- 用户点了“拒绝”
+- 或者直接把弹窗关掉了
+
+处理方式：
+
+- 重新执行一次 `setup.js`
+- 在 macOS 的 Keychain 授权弹窗里点“允许”
+- 如果还是失败，先确认当前登录了桌面会话，并且 `login.keychain-db` 处于可用状态
+
+### 4. 图片没有保存到预期目录
 
 检查：
 
@@ -529,7 +549,7 @@ node "$SKILL_DIR/scripts/setup.js" \
 - 这次是否传了 `--profile`
 - 这次是否传了 `--output` 或 `--out-dir`
 
-### 4. 接口不是异步任务结构，能不能用
+### 5. 接口不是异步任务结构，能不能用
 
 可以。当前脚本兼容：
 
@@ -537,7 +557,7 @@ node "$SKILL_DIR/scripts/setup.js" \
 - 直接返回图片 URL
 - 直接返回 base64
 
-### 5. 能不能支持多个站点和多个 key
+### 6. 能不能支持多个站点和多个 key
 
 可以，这就是 profile 机制存在的原因。
 

@@ -92,6 +92,33 @@ function buildKeychainAccount(profileName, configPath) {
   return `${profileName}:${hash}`;
 }
 
+function formatKeychainError(action, stderr, account) {
+  const message = String(stderr || '').trim();
+  const actionLabel = action === 'read'
+    ? '读取 Keychain 失败'
+    : action === 'delete'
+      ? '删除 Keychain 记录失败'
+      : '写入 Keychain 失败';
+
+  if (message.includes('The authorization was canceled by the user')) {
+    return `${actionLabel}：你取消了 macOS 的 Keychain 授权弹窗。请重新执行一次，并在系统弹窗中点“允许”。${account ? ` account=${account}` : ''}`;
+  }
+
+  if (message.includes('User interaction is not allowed')) {
+    return `${actionLabel}：当前 macOS 不允许进行 Keychain 交互。请确认你已登录桌面会话、登录钥匙串已解锁，然后重试。${account ? ` account=${account}` : ''}`;
+  }
+
+  if (action === 'read' && message.includes('could not be found')) {
+    return `无法从 Keychain 读取 key：没有找到对应记录，请重新执行一次 setup.js 以写回该 profile 的 key。account=${account}`;
+  }
+
+  if (action === 'delete' && message.includes('could not be found')) {
+    return '';
+  }
+
+  return message;
+}
+
 function saveKeychainSecret(account, secret) {
   if (!commandExists('security')) {
     throw new Error('缺少 macOS Keychain 依赖：未找到 security 命令。请先征求用户同意，再补齐该依赖，因为此 skill 需要用 Keychain 安全存储 API Key。');
@@ -102,7 +129,7 @@ function saveKeychainSecret(account, secret) {
   });
 
   if (result.status !== 0) {
-    throw new Error(result.stderr?.trim() || '写入 Keychain 失败');
+    throw new Error(formatKeychainError('write', result.stderr, account) || '写入 Keychain 失败');
   }
 }
 
@@ -116,7 +143,7 @@ function readKeychainSecret(account) {
   });
 
   if (result.status !== 0) {
-    throw new Error(`无法从 Keychain 读取 key，请检查 profile 配置: ${account}`);
+    throw new Error(formatKeychainError('read', result.stderr, account) || `无法从 Keychain 读取 key，请检查 profile 配置: ${account}`);
   }
 
   return result.stdout.trim();
@@ -132,8 +159,11 @@ function deleteKeychainSecret(account) {
   });
 
   if (result.status !== 0) {
-    const stderr = (result.stderr || '').trim();
+    const stderr = formatKeychainError('delete', result.stderr, account);
     if (stderr.includes('could not be found')) {
+      return false;
+    }
+    if (!stderr) {
       return false;
     }
     throw new Error(stderr || `删除 Keychain 记录失败: ${account}`);
