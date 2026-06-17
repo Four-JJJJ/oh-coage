@@ -572,6 +572,12 @@ node "$SKILL_DIR/scripts/setup.js" \
    - 临时切换：生成时传 `--profile`
    - 长期切换：`setup.js --activate-profile`
 
+## Acknowledgements
+
+致谢原始项目：
+
+- [bozhouDev/images2-gen](https://github.com/bozhouDev/images2-gen)
+
 ## License
 
-按你的项目需要自行补充。
+本项目采用 MIT License，详见 [LICENSE](./LICENSE)。
