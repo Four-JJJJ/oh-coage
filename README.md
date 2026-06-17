@@ -4,7 +4,7 @@
 
 这个 skill 固定使用 `gpt-image-2` 模型，但不绑定某一家站点。它支持你在**首次使用时本地初始化**：
 
-- 让用户先决定图片保存目录
+- 让用户先决定图片总保存目录
 - 让用户填写站点 `base_url`
 - 让用户填写 `api_key`
 - 把敏感的 `api_key` 存进 **macOS Keychain**
@@ -106,7 +106,7 @@ git clone https://github.com/Four-JJJJ/oh-coage.git
 
 应先询问用户这 4 个值：
 
-1. 图片保存到哪个文件夹
+1. 图片总保存到哪个文件夹
 2. profile 名称是什么
 3. 站点 URL 是什么
 4. API Key 是什么
@@ -183,7 +183,7 @@ node "$SKILL_DIR/scripts/generate.js" \
 - 读取当前 active profile
 - 自动从 Keychain 读取该 profile 的 key
 - 调用该 profile 对应的 `base_url`
-- 生成成功后自动保存到该 profile 的输出目录
+- 生成成功后先在该 profile 的总目录下创建一个时间命名子文件夹，再把图片保存进去
 - `stdout` 输出最终本地文件路径
 
 ## 图生图
@@ -243,7 +243,7 @@ node "$SKILL_DIR/scripts/setup.js" [options]
 主要参数：
 
 - `--output-dir`
-  - 初始化或新增 profile 时，指定默认保存目录
+  - 初始化或新增 profile 时，指定图片总保存目录
 - `--profile`
   - 初始化或新增 profile 时，指定 profile 名
 - `--base-url`

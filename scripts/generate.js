@@ -21,7 +21,7 @@ const VALID_4K_SIZES = new Set(['16:9', '9:16', '2:1', '1:2', '21:9', '9:21']);
 function printSetupInstructions() {
   console.error('错误：尚未完成 oh-coage 初始化。');
   console.error('请先让 agent 收集以下信息后运行 setup.js：');
-  console.error('1. 图片输出目录');
+  console.error('1. 图片总保存目录');
   console.error('2. profile 名称');
   console.error('3. base_url');
   console.error('4. api_key');
@@ -159,14 +159,27 @@ function inferExtension(contentType, source) {
   return '.png';
 }
 
-function buildOutputPath(output, outDir, extension) {
+function formatTimestampForDir(date = new Date()) {
+  const pad = (value, width = 2) => String(value).padStart(width, '0');
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+    '-',
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds()),
+  ].join('');
+}
+
+function buildOutputPath(output, outDir, extension, runDir) {
   if (output) {
     ensureDir(path.dirname(output));
     return output;
   }
 
-  ensureDir(outDir);
-  return path.join(outDir, `oh-coage-${Date.now()}${extension}`);
+  ensureDir(runDir);
+  return path.join(runDir, `oh-coage-${Date.now()}${extension}`);
 }
 
 async function downloadToFile(url, filePath) {
@@ -187,7 +200,7 @@ async function downloadToFile(url, filePath) {
   });
 }
 
-async function saveImage(image, output, outDir) {
+async function saveImage(image, output, outDir, runDir) {
   if (!output && !outDir) {
     return null;
   }
@@ -199,13 +212,13 @@ async function saveImage(image, output, outDir) {
       throw new Error('base64 图片格式不合法');
     }
 
-    const filePath = buildOutputPath(output, outDir, inferExtension(meta, dataUri));
+    const filePath = buildOutputPath(output, outDir, inferExtension(meta, dataUri), runDir);
     fs.writeFileSync(filePath, Buffer.from(encoded, 'base64'));
     return filePath;
   }
 
   if (image.imageUrl) {
-    const filePath = buildOutputPath(output, outDir, inferExtension('', image.imageUrl));
+    const filePath = buildOutputPath(output, outDir, inferExtension('', image.imageUrl), runDir);
     await downloadToFile(image.imageUrl, filePath);
     return filePath;
   }
@@ -264,6 +277,7 @@ function resolveRuntimeConfig(cli) {
 async function main() {
   const cli = parseArgs();
   const runtime = resolveRuntimeConfig(cli);
+  const runDir = runtime.outDir ? path.join(runtime.outDir, formatTimestampForDir()) : null;
 
   let finalResolution = cli.resolution;
   if (cli.resolution === '4k' && !VALID_4K_SIZES.has(cli.size)) {
@@ -284,9 +298,12 @@ async function main() {
     ? await (process.stderr.write(`任务已提交: ${submitted.taskId}\n`), pollTask(runtime.apiKey, runtime.baseUrl, submitted.taskId))
     : (process.stderr.write('接口直接返回了图片结果\n'), submitted.image);
 
-  const savedPath = await saveImage(image, cli.output, runtime.outDir);
+  const savedPath = await saveImage(image, cli.output, runtime.outDir, runDir);
   if (savedPath) {
     process.stderr.write(`图片已保存到本地: ${savedPath}\n`);
+    if (runDir) {
+      process.stderr.write(`图片目录: ${runDir}\n`);
+    }
     console.log(savedPath);
     return;
   }
