@@ -1,0 +1,10 @@
+{
+  "name": "oh-coage",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check scripts/config-store.js && node --check scripts/setup.js && node --check scripts/generate.js"
+  }
+}

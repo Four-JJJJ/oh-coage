@@ -259,7 +259,9 @@ node "$SKILL_DIR/scripts/generate.js" \
 ```
 
 - 可重复传入 `--image-url` 提供多张图
-- 如果用户给的是本地文件路径，先读文件并转为 base64 data URI 再传入
+- `--image-url` 支持 URL、base64 data URI 和本地图片文件路径
+- 如果用户给的是本地文件路径，可以直接传给脚本；脚本会自动读取文件并转为 base64 data URI 上传
+- 支持的本地图片格式：`png`、`jpg`、`jpeg`、`webp`、`gif`
 
 ## 参数选择
 

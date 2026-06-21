@@ -215,8 +215,17 @@ node "$SKILL_DIR/scripts/generate.js" \
 - 多张参考图（重复传 `--image-url`）
 - URL
 - base64 data URI
+- 本地图片文件路径（脚本会自动转为 base64 data URI 上传给接口）
 
-如果上层 agent 收到的是本地图片路径，建议先把文件转为 base64 data URI 再传给脚本。
+本地图片路径示例：
+
+```bash
+node "$SKILL_DIR/scripts/generate.js" \
+  --prompt "turn this into watercolor style" \
+  --image-url "/Users/you/Pictures/input.png"
+```
+
+支持的本地图片格式：`png`、`jpg`、`jpeg`、`webp`、`gif`。
 
 ## 参数说明
 

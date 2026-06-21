@@ -25,6 +25,13 @@ const POLL_TIMEOUT_MS = 20 * 1000;
 const TASK_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_RETRY_ATTEMPTS = 2;
 const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
+const IMAGE_MIME_TYPES = new Map([
+  ['.png', 'image/png'],
+  ['.jpg', 'image/jpeg'],
+  ['.jpeg', 'image/jpeg'],
+  ['.webp', 'image/webp'],
+  ['.gif', 'image/gif'],
+]);
 
 function printSetupInstructions() {
   console.error('错误：尚未完成 oh-coage 初始化。');
@@ -195,6 +202,41 @@ function inferExtension(contentType, source) {
   if (contentType?.includes('webp') || source?.startsWith('data:image/webp')) return '.webp';
   if (contentType?.includes('jpeg') || contentType?.includes('jpg') || source?.startsWith('data:image/jpeg')) return '.jpg';
   return '.png';
+}
+
+function looksLikeRemoteImageReference(value) {
+  return /^https?:\/\//i.test(value) || /^data:image\//i.test(value);
+}
+
+function imageFileToDataUri(filePath) {
+  const resolvedPath = path.resolve(filePath);
+  if (!fs.existsSync(resolvedPath)) {
+    throw new Error(`参考图片不存在: ${resolvedPath}`);
+  }
+
+  const stat = fs.statSync(resolvedPath);
+  if (!stat.isFile()) {
+    throw new Error(`参考图片不是文件: ${resolvedPath}`);
+  }
+
+  const extension = path.extname(resolvedPath).toLowerCase();
+  const mimeType = IMAGE_MIME_TYPES.get(extension);
+  if (!mimeType) {
+    throw new Error(`不支持的参考图片格式: ${extension || '无扩展名'}。支持 png、jpg、jpeg、webp、gif。`);
+  }
+
+  const encoded = fs.readFileSync(resolvedPath).toString('base64');
+  return `data:${mimeType};base64,${encoded}`;
+}
+
+function normalizeImageReferences(imageUrls) {
+  return imageUrls.map((value) => {
+    if (looksLikeRemoteImageReference(value)) {
+      return value;
+    }
+
+    return imageFileToDataUri(value);
+  });
 }
 
 function formatTimestampForDir(date = new Date()) {
@@ -471,6 +513,7 @@ async function runCandidate(candidate, cli, finalResolution, runRecord) {
 
 async function main() {
   const cli = parseArgs();
+  cli.imageUrls = normalizeImageReferences(cli.imageUrls);
   const runtime = resolveRuntimeConfig(cli);
   const startedAt = new Date();
   const runRecord = {
