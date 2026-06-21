@@ -199,6 +199,8 @@ node "$SKILL_DIR/scripts/generate.js" \
 - 在任务子目录内写入 `meta.json`
 - 在 `~/.oh-coage/runs.jsonl` 追加本次运行日志
 
+如果接口返回 `task_id`，脚本会自动回收异步任务结果。回收节奏是 `5s -> 10s -> 20s -> 30s -> 60s -> 60s -> 60s`，之后继续以 `60s` 间隔查询，直到达到 5 分钟总超时。
+
 如果用户明确要切换 profile，可在生成时指定：
 
 ```bash

@@ -25,6 +25,7 @@ const POLL_TIMEOUT_MS = 20 * 1000;
 const TASK_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_RETRY_ATTEMPTS = 2;
 const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
+const POLL_DELAYS_MS = [5, 10, 20, 30, 60, 60, 60].map((seconds) => seconds * 1000);
 const IMAGE_MIME_TYPES = new Map([
   ['.png', 'image/png'],
   ['.jpg', 'image/jpeg'],
@@ -165,18 +166,26 @@ async function submitGeneration(apiKey, baseUrl, prompt, size, resolution, image
   throw new Error(`无法识别生成接口返回结构: ${JSON.stringify(result)}`);
 }
 
-async function pollTask(apiKey, baseUrl, taskId) {
-  const interval = 5000;
-  const start = Date.now();
+function pollDelayForAttempt(attemptIndex) {
+  return POLL_DELAYS_MS[Math.min(attemptIndex, POLL_DELAYS_MS.length - 1)];
+}
+
+async function pollTask(apiKey, baseUrl, taskId, options = {}) {
+  const sleepFn = options.sleep || sleep;
+  const requestFn = options.request || request;
+  const now = options.now || Date.now;
+  const start = now();
+  let pollCount = 0;
 
   while (true) {
-    if (Date.now() - start > TASK_TIMEOUT_MS) {
-      throw new Error(`任务超时（超过 ${TASK_TIMEOUT_MS}ms）`);
+    if (now() - start > TASK_TIMEOUT_MS) {
+      throw new Error(`任务超时（超过 ${TASK_TIMEOUT_MS}ms，已轮询 ${pollCount} 次）`);
     }
 
-    const result = await request(`${baseUrl}/tasks/${taskId}`, {
+    const result = await requestFn(`${baseUrl}/tasks/${taskId}`, {
       headers: { Authorization: `Bearer ${apiKey}` },
     }, null, POLL_TIMEOUT_MS);
+    pollCount += 1;
 
     const { status, progress, result: taskResult, error } = result.data;
 
@@ -192,8 +201,9 @@ async function pollTask(apiKey, baseUrl, taskId) {
       throw new Error(error?.message || '任务失败');
     }
 
-    process.stderr.write(`生成中... ${progress || 0}%\n`);
-    await sleep(interval);
+    const delay = pollDelayForAttempt(pollCount - 1);
+    process.stderr.write(`生成中... ${progress || 0}%（第 ${pollCount} 次回收，${Math.round(delay / 1000)}s 后继续）\n`);
+    await sleepFn(delay);
   }
 }
 
@@ -581,7 +591,15 @@ async function main() {
   throw new Error('没有可用的 profile 可继续尝试');
 }
 
-main().catch((error) => {
-  console.error(`错误：${error.message}`);
-  process.exit(1);
-});
+if (process.env.OH_COAGE_TEST === '1') {
+  module.exports = {
+    POLL_DELAYS_MS,
+    pollDelayForAttempt,
+    pollTask,
+  };
+} else {
+  main().catch((error) => {
+    console.error(`错误：${error.message}`);
+    process.exit(1);
+  });
+}

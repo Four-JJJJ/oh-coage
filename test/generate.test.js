@@ -121,3 +121,45 @@ test('generate reports a clear error for missing local image-url paths', async (
   assert.match(result.stderr, /参考图片不存在/);
   assert.match(result.stderr, new RegExp(missingPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 });
+
+test('pollTask uses an increasing recovery schedule for async image tasks', async () => {
+  const previousTestFlag = process.env.OH_COAGE_TEST;
+  process.env.OH_COAGE_TEST = '1';
+  delete require.cache[require.resolve('../scripts/generate')];
+  const { pollTask, POLL_DELAYS_MS } = require('../scripts/generate');
+  if (previousTestFlag === undefined) {
+    delete process.env.OH_COAGE_TEST;
+  } else {
+    process.env.OH_COAGE_TEST = previousTestFlag;
+  }
+
+  const waits = [];
+  const requestedUrls = [];
+  const responses = [
+    { data: { status: 'pending', progress: 0 } },
+    { data: { status: 'running', progress: 40 } },
+    { data: { status: 'running', progress: 80 } },
+    { data: { status: 'completed', result: { images: [{ b64_json: 'abc123' }] } } },
+  ];
+
+  const image = await pollTask('test-key', 'https://image.example/v1', 'task-123', {
+    now: (() => {
+      let current = 0;
+      return () => current += 1;
+    })(),
+    request: async (url) => {
+      requestedUrls.push(url);
+      return responses.shift();
+    },
+    sleep: async (ms) => { waits.push(ms); },
+  });
+
+  assert.deepEqual(waits, POLL_DELAYS_MS.slice(0, 3));
+  assert.deepEqual(requestedUrls, [
+    'https://image.example/v1/tasks/task-123',
+    'https://image.example/v1/tasks/task-123',
+    'https://image.example/v1/tasks/task-123',
+    'https://image.example/v1/tasks/task-123',
+  ]);
+  assert.deepEqual(image, { imageUrl: undefined, base64: 'abc123' });
+});
