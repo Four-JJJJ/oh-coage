@@ -390,7 +390,7 @@ function resolveRuntimeConfig(cli) {
     name,
     keychainAccount: profile.keychain_account,
     baseUrl: normalizeBaseUrl(cli.baseUrl || process.env.IMAGES2_GEN_BASE_URL || profile.base_url || DEFAULT_BASE_URL),
-    rootOutputDir: cli.outDir ? path.resolve(cli.outDir) : path.resolve(profile.root_output_dir || profile.output_dir || process.cwd()),
+    rootOutputDir: cli.outDir ? path.resolve(cli.outDir) : path.resolve(profile.resolved_root_output_dir || profile.root_output_dir || profile.output_dir || process.cwd()),
     outputOverride: cli.output || null,
     source: 'profile',
   }));

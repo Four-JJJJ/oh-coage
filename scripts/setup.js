@@ -124,10 +124,10 @@ async function healthCheck(options) {
     checks.push({ item: 'enabled', ok: profile.enabled !== false, detail: profile.enabled === false ? 'disabled' : 'enabled' });
 
     try {
-      const rootOutputDir = profile.root_output_dir || profile.output_dir;
+      const rootOutputDir = profile.resolved_root_output_dir || profile.root_output_dir || profile.output_dir;
       ensureDir(rootOutputDir);
       fs.accessSync(rootOutputDir, fs.constants.W_OK);
-      checks.push({ item: 'root_output_dir', ok: true, detail: rootOutputDir });
+      checks.push({ item: 'root_output_dir', ok: true, detail: `${profile.root_output_dir || profile.output_dir} -> ${rootOutputDir}` });
     } catch (error) {
       checks.push({ item: 'root_output_dir', ok: false, detail: error.message });
     }

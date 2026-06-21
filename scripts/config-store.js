@@ -58,6 +58,19 @@ function getDefaultConfigPath(outputDir) {
   return path.join(path.resolve(outputDir), DEFAULT_CONFIG_FILENAME);
 }
 
+function resolveProfileOutputDir(profile, configPath) {
+  const configuredDir = profile?.root_output_dir || profile?.output_dir;
+  if (!configuredDir) {
+    return null;
+  }
+
+  if (path.isAbsolute(configuredDir)) {
+    return path.resolve(configuredDir);
+  }
+
+  return path.resolve(path.dirname(path.resolve(configPath)), configuredDir);
+}
+
 function loadConfigFromPath(configPath) {
   const config = readJson(configPath, null);
   if (!config) {
@@ -68,6 +81,9 @@ function loadConfigFromPath(configPath) {
   for (const profile of Object.values(config.profiles)) {
     if (profile && !profile.root_output_dir && profile.output_dir) {
       profile.root_output_dir = profile.output_dir;
+    }
+    if (profile) {
+      profile.resolved_root_output_dir = resolveProfileOutputDir(profile, configPath);
     }
   }
   return config;
@@ -198,6 +214,7 @@ module.exports = {
   getDefaultConfigPath,
   loadConfigFromPath,
   loadActiveConfig,
+  resolveProfileOutputDir,
   saveConfig,
   buildKeychainAccount,
   saveKeychainSecret,
