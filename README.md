@@ -77,7 +77,36 @@ node -v
 
 ## 安装方式
 
-把这个仓库作为 skill 安装到你的 agent skills 目录。
+这个仓库同时支持传统 skill 和 Codex plugin 两种安装方式。插件结构位于：
+
+```text
+.
+├── .codex-plugin/plugin.json
+├── skills/oh-coage/SKILL.md
+└── scripts/
+```
+
+### Codex plugin
+
+仓库公开后，任何人都可以从 GitHub 安装这个插件：
+
+```bash
+codex plugin marketplace add Four-JJJJ/oh-coage --ref main
+codex plugin add oh-coage@oh-coage
+```
+
+更新到最新版本时：
+
+```bash
+codex plugin marketplace upgrade oh-coage
+codex plugin add oh-coage@oh-coage
+```
+
+安装只会获取插件代码。每位用户都需要在自己的机器上完成初始化并提供自己的站点地址和 API Key；密钥不会随仓库、插件包或配置文件分发。
+
+### 传统 skill
+
+如果只按旧方式使用，也可以把这个仓库作为 skill 安装到你的 agent skills 目录。
 
 例如：
 
@@ -106,6 +135,8 @@ git clone https://github.com/Four-JJJJ/oh-coage.git
 ## 首次使用流程
 
 第一次使用时，不要直接调用生成脚本，先初始化。
+
+在 Codex 插件模式下，初始化会优先展示一个可交互表单，填写 profile、站点 URL 和 API Key 后提交。图片保存目录会自动使用当前项目根目录；没有项目上下文时默认使用桌面，也可以手动修改路径。表单不可用时才回退到聊天输入。
 
 应先询问用户这 4 个值：
 
@@ -140,7 +171,7 @@ node "$SKILL_DIR/scripts/setup.js" \
 示例：
 
 ```text
-/Users/you/Pictures/AI/oh-coage-config.json
+<图片总目录>/oh-coage-config.json
 ```
 
 2. 全局状态文件
@@ -167,14 +198,13 @@ node "$SKILL_DIR/scripts/setup.js" \
   "profiles": {
     "main": {
       "base_url": "https://image.example.com/v1",
-      "root_output_dir": "/Users/you/Pictures/AI",
-      "keychain_account": "main:abcd1234efgh"
+      "root_output_dir": "<图片总目录>"
     }
   }
 }
 ```
 
-不会把真实 `api_key` 写进这个文件。
+不会把真实 `api_key` 写进这个文件。脚本会额外维护一个由系统使用的 Keychain account 标识，但它不需要手动填写或共享。
 
 字段语义上，`root_output_dir` 表示图片总目录。每次生成时，脚本会在这个总目录下再自动创建一个时间命名的任务子目录。
 
@@ -222,7 +252,7 @@ node "$SKILL_DIR/scripts/generate.js" \
 ```bash
 node "$SKILL_DIR/scripts/generate.js" \
   --prompt "turn this into watercolor style" \
-  --image-url "/Users/you/Pictures/input.png"
+  --image-url "/path/to/input.png"
 ```
 
 支持的本地图片格式：`png`、`jpg`、`jpeg`、`webp`、`gif`。
@@ -318,7 +348,7 @@ node "$SKILL_DIR/scripts/setup.js" --health-check --live
 
 ```bash
 node "$SKILL_DIR/scripts/setup.js" \
-  --output-dir "/Users/you/Pictures/AI-backup" \
+  --output-dir "/path/to/backup-images" \
   --profile "backup" \
   --base-url "https://another-image-site.example/v1" \
   --api-key "YOUR_BACKUP_KEY"

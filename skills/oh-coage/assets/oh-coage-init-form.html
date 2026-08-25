@@ -1,0 +1,154 @@
+<style>
+#oh-coage-init-form {
+  max-width: 680px;
+}
+
+#oh-coage-init-form .init-header {
+  margin-bottom: 20px;
+}
+
+#oh-coage-init-form .init-header h2 {
+  margin: 0;
+}
+
+#oh-coage-init-form .init-header p {
+  margin: 8px 0 0;
+}
+
+#oh-coage-init-form .init-fields {
+  display: grid;
+  gap: 20px;
+}
+
+#oh-coage-init-form .init-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+}
+
+#oh-coage-init-form .init-field {
+  display: grid;
+  gap: 8px;
+}
+
+#oh-coage-init-form .init-path-meta {
+  margin: 8px 0 0;
+}
+
+#oh-coage-init-form .init-actions {
+  display: grid;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+#oh-coage-init-form [hidden] {
+  display: none !important;
+}
+
+@media (max-width: 560px) {
+  #oh-coage-init-form .init-grid {
+    grid-template-columns: 1fr;
+  }
+}
+</style>
+
+<div id="oh-coage-init-form" class="card" data-has-project="false">
+  <form id="oh-coage-init-form-fields">
+    <div class="init-header">
+      <h2>初始化 oh-coage</h2>
+      <p class="text-muted">配置一次后，图片会自动保存到默认目录。</p>
+    </div>
+
+    <div class="init-fields">
+      <label class="form-label init-field">
+        图片保存目录
+        <input class="form-control" name="outputDir" type="text" placeholder="自动使用当前项目目录或桌面" autocomplete="off" required>
+        <span id="oh-coage-output-dir-hint" class="init-path-meta text-small text-muted"></span>
+      </label>
+
+      <label id="oh-coage-project-option" class="form-check" hidden>
+        <input id="oh-coage-use-project-dir" class="form-check-input" name="useProjectDir" type="checkbox" value="true" checked>
+        <span class="form-check-label">保存在项目文件夹内</span>
+      </label>
+
+      <div class="init-grid">
+        <label class="form-label init-field">
+          Profile 名称
+          <input class="form-control" name="profile" type="text" value="default" autocomplete="off" required>
+        </label>
+        <label class="form-label init-field">
+          生图站点 URL
+        <input class="form-control" name="baseUrl" type="url" placeholder="https://example.com/v1" autocomplete="url" required>
+        </label>
+        <label class="form-label init-field">
+          API Key
+          <input class="form-control" name="apiKey" type="password" autocomplete="new-password" required>
+        </label>
+      </div>
+    </div>
+
+    <div class="init-actions">
+      <p class="text-small text-muted">API Key 不会写入普通配置文件，也不会保存在表单浏览器中；提交后会进入当前 task 的初始化消息，并由本机脚本写入 Keychain。</p>
+      <button id="oh-coage-init-form-submit" class="btn btn-primary btn-block" type="button">保存并初始化</button>
+      <p id="oh-coage-init-form-status" class="text-small" role="status" aria-live="polite"></p>
+    </div>
+  </form>
+</div>
+
+<script>
+(() => {
+  const root = document.getElementById('oh-coage-init-form');
+  const form = document.getElementById('oh-coage-init-form-fields');
+  const outputDir = form?.querySelector('[name="outputDir"]');
+  const outputDirHint = document.getElementById('oh-coage-output-dir-hint');
+  const projectOption = document.getElementById('oh-coage-project-option');
+  const useProjectDir = document.getElementById('oh-coage-use-project-dir');
+  const submitButton = document.getElementById('oh-coage-init-form-submit');
+  const status = document.getElementById('oh-coage-init-form-status');
+
+  if (!root || !form || !outputDir || !outputDirHint || !projectOption || !useProjectDir || !submitButton || !status) return;
+
+  const hasProject = root.dataset.hasProject === 'true';
+  projectOption.hidden = !hasProject;
+  useProjectDir.checked = hasProject;
+  useProjectDir.disabled = !hasProject;
+  outputDirHint.textContent = hasProject
+    ? '已检测到当前项目，默认保存在项目文件夹内；也可以直接修改路径。'
+    : '当前没有项目，默认使用桌面；也可以直接输入其他路径。';
+
+  submitButton.addEventListener('click', async () => {
+    if (!form.reportValidity()) return;
+
+    const values = Object.fromEntries(new FormData(form).entries());
+    const sendFollowUpMessage = window.openai?.sendFollowUpMessage;
+
+    if (typeof sendFollowUpMessage !== 'function') {
+      status.textContent = '当前环境不支持提交表单，请直接在对话中输入初始化信息。';
+      status.className = 'text-small text-destructive';
+      return;
+    }
+
+    status.textContent = '正在提交初始化信息...';
+    status.className = 'text-small text-muted';
+    submitButton.disabled = true;
+
+    try {
+      await sendFollowUpMessage({
+        title: '初始化 oh-coage',
+        prompt: [
+          '用户已通过 oh-coage 初始化表单提交配置。请立即执行初始化，不要再次询问这些字段。',
+          'OH_COAGE_INIT_FORM_SUBMISSION',
+          JSON.stringify(values),
+          '使用插件内的 scripts/setup.js，以 --activate 初始化当前 profile。不要在输出、日志或回复中展示 API Key。初始化完成后运行一次本地 health-check，并报告 profile、保存目录和检查结果。',
+        ].join('\n'),
+      });
+      status.textContent = '已提交，正在完成本地初始化。';
+      status.className = 'text-small text-muted';
+    } catch (error) {
+      status.textContent = `提交失败：${error?.message || '未知错误'}`;
+      status.className = 'text-small text-destructive';
+      submitButton.disabled = false;
+    }
+  });
+})();
+</script>

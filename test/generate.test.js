@@ -119,7 +119,7 @@ test('generate reports a clear error for missing local image-url paths', async (
 
   assert.equal(result.code, 1);
   assert.match(result.stderr, /参考图片不存在/);
-  assert.match(result.stderr, new RegExp(missingPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.doesNotMatch(result.stderr, new RegExp(missingPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 });
 
 test('pollTask uses an increasing recovery schedule for async image tasks', async () => {

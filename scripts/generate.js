@@ -221,12 +221,12 @@ function looksLikeRemoteImageReference(value) {
 function imageFileToDataUri(filePath) {
   const resolvedPath = path.resolve(filePath);
   if (!fs.existsSync(resolvedPath)) {
-    throw new Error(`参考图片不存在: ${resolvedPath}`);
+    throw new Error('参考图片不存在');
   }
 
   const stat = fs.statSync(resolvedPath);
   if (!stat.isFile()) {
-    throw new Error(`参考图片不是文件: ${resolvedPath}`);
+    throw new Error('参考图片不是文件');
   }
 
   const extension = path.extname(resolvedPath).toLowerCase();

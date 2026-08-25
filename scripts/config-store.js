@@ -32,7 +32,7 @@ function readJson(filePath, fallback = null) {
   try {
     return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
   } catch (error) {
-    throw new Error(`无法解析 JSON 文件 ${filePath}: ${error.message}`);
+    throw new Error(`无法解析 JSON 配置文件：${error.message}`);
   }
 }
 
@@ -108,7 +108,7 @@ function buildKeychainAccount(profileName, configPath) {
   return `${profileName}:${hash}`;
 }
 
-function formatKeychainError(action, stderr, account) {
+function formatKeychainError(action, stderr) {
   const message = String(stderr || '').trim();
   const actionLabel = action === 'read'
     ? '读取 Keychain 失败'
@@ -117,15 +117,15 @@ function formatKeychainError(action, stderr, account) {
       : '写入 Keychain 失败';
 
   if (message.includes('The authorization was canceled by the user')) {
-    return `${actionLabel}：你取消了 macOS 的 Keychain 授权弹窗。请重新执行一次，并在系统弹窗中点“允许”。${account ? ` account=${account}` : ''}`;
+    return `${actionLabel}：你取消了 macOS 的 Keychain 授权弹窗。请重新执行一次，并在系统弹窗中点“允许”。`;
   }
 
   if (message.includes('User interaction is not allowed')) {
-    return `${actionLabel}：当前 macOS 不允许进行 Keychain 交互。请确认你已登录桌面会话、登录钥匙串已解锁，然后重试。${account ? ` account=${account}` : ''}`;
+    return `${actionLabel}：当前 macOS 不允许进行 Keychain 交互。请确认你已登录桌面会话、登录钥匙串已解锁，然后重试。`;
   }
 
   if (action === 'read' && message.includes('could not be found')) {
-    return `无法从 Keychain 读取 key：没有找到对应记录，请重新执行一次 setup.js 以写回该 profile 的 key。account=${account}`;
+    return '无法从 Keychain 读取 key：没有找到对应记录，请重新执行一次 setup.js 以写回该 profile 的 key。';
   }
 
   if (action === 'delete' && message.includes('could not be found')) {
@@ -145,7 +145,7 @@ function saveKeychainSecret(account, secret) {
   });
 
   if (result.status !== 0) {
-    throw new Error(formatKeychainError('write', result.stderr, account) || '写入 Keychain 失败');
+    throw new Error(formatKeychainError('write', result.stderr) || '写入 Keychain 失败');
   }
 }
 
@@ -159,7 +159,7 @@ function readKeychainSecret(account) {
   });
 
   if (result.status !== 0) {
-    throw new Error(formatKeychainError('read', result.stderr, account) || `无法从 Keychain 读取 key，请检查 profile 配置: ${account}`);
+    throw new Error(formatKeychainError('read', result.stderr) || '无法从 Keychain 读取 key，请检查 profile 配置。');
   }
 
   return result.stdout.trim();
@@ -175,14 +175,14 @@ function deleteKeychainSecret(account) {
   });
 
   if (result.status !== 0) {
-    const stderr = formatKeychainError('delete', result.stderr, account);
+    const stderr = formatKeychainError('delete', result.stderr);
     if (stderr.includes('could not be found')) {
       return false;
     }
     if (!stderr) {
       return false;
     }
-    throw new Error(stderr || `删除 Keychain 记录失败: ${account}`);
+    throw new Error(stderr || '删除 Keychain 记录失败');
   }
 
   return true;

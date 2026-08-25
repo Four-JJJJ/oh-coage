@@ -1,0 +1,18 @@
+# Credentials and user-specific configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+oh-coage-config.json
+.oh-coage/
+
+# Generated images and local test output
+20??????-??????/
+node_modules/
+coverage/
+
+# Operating-system metadata
+.DS_Store

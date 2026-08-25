@@ -1,0 +1,36 @@
+{
+  "name": "oh-coage",
+  "version": "0.1.0+codex.20260825024640",
+  "description": "\u901a\u8fc7\u53ef\u914d\u7f6e\u7684 GPT-Image-2 API \u5728 Codex \u4e2d\u751f\u6210\u548c\u7f16\u8f91\u56fe\u7247\u3002",
+  "author": {
+    "name": "Four-JJJJ",
+    "url": "https://github.com/Four-JJJJ"
+  },
+  "license": "MIT",
+  "keywords": [
+    "image-generation",
+    "gpt-image-2",
+    "image-editing",
+    "keychain"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "oh-coage",
+    "shortDescription": "\u5728 Codex \u4e2d\u751f\u6210\u548c\u7f16\u8f91\u56fe\u7247\u3002",
+    "longDescription": "\u4f7f\u7528\u53ef\u914d\u7f6e\u7ad9\u70b9\u7684 GPT-Image-2 API\uff0c\u652f\u6301\u6587\u751f\u56fe\u3001\u56fe\u751f\u56fe\u3001\u5f02\u6b65\u4efb\u52a1\u8f6e\u8be2\u3001\u591a profile fallback\uff0c\u4ee5\u53ca macOS Keychain \u5bc6\u94a5\u5b58\u50a8\u3002",
+    "developerName": "Four-JJJJ",
+    "category": "Productivity",
+    "capabilities": [
+      "Image generation",
+      "Image editing",
+      "Local file output",
+      "Interactive setup"
+    ],
+    "defaultPrompt": [
+      "\u5e2e\u6211\u751f\u6210\u4e00\u5f20\u56fe\u7247",
+      "\u53c2\u8003\u8fd9\u5f20\u56fe\u91cd\u65b0\u521b\u4f5c",
+      "\u68c0\u67e5 oh-coage \u5f53\u524d\u914d\u7f6e"
+    ],
+    "brandColor": "#2563EB"
+  }
+}
