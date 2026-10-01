@@ -86,6 +86,20 @@ function resolveModel(input, customModels) {
     return { ...byModelId, source: 'model-id' };
   }
 
+  // 用户口语里常只叫后半截（「用 flare 画」）。只在能唯一确定时接受，多义一律报错。
+  const bySuffix = catalog.filter((entry) => (
+    normalizeModelInput(entry.key).endsWith(`-${raw}`)
+    || normalizeModelInput(entry.model).endsWith(`-${raw}`)
+  ));
+
+  if (bySuffix.length === 1) {
+    return { ...bySuffix[0], source: 'suffix' };
+  }
+
+  if (bySuffix.length > 1) {
+    throw new Error(`\`${input}\` 匹配到多个模型，请明确指定其中一个：\n${formatModelOptions(bySuffix)}`);
+  }
+
   throw new Error(`未知模型：${input}\n可用模型：\n${formatModelOptions(catalog)}`);
 }
 

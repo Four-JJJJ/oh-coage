@@ -82,3 +82,29 @@ test('both SKILL.md entry points advertise the same trigger description', () => 
     '两份 SKILL.md 的触发描述必须一致，否则整仓安装与单目录安装的触发行为会不同',
   );
 });
+
+test('both entry points advertise the model-switching triggers', () => {
+  const triggers = ['切换模型', '换模型', '改成 xxx 模型', '使用 xxx 模型'];
+
+  for (const filePath of [entryDocPath, skillDocPath]) {
+    const source = fs.readFileSync(filePath, 'utf8');
+    const frontmatter = source.match(/^---\n([\s\S]*?)\n---/);
+    assert.ok(frontmatter, `${filePath} 缺少 frontmatter`);
+
+    for (const trigger of triggers) {
+      assert.ok(
+        frontmatter[1].includes(trigger),
+        `${filePath} 的 frontmatter 应包含模型切换触发词：${trigger}`,
+      );
+    }
+  }
+});
+
+test('the authoritative doc spells out the model-switching flow', () => {
+  const source = fs.readFileSync(skillDocPath, 'utf8');
+
+  assert.match(source, /### 用户想换模型时/, '应有一节说明如何处理换模型请求');
+  assert.match(source, /--list-models/, '没点名模型时应先列出来让用户选');
+  assert.match(source, /不要自己猜|不要替用户猜/, '不完整的模型说法必须问清而不是猜');
+  assert.match(source, /--profile-model/, '应说明「只让某个站点用」要用 --profile-model');
+});

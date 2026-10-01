@@ -1,6 +1,6 @@
 ---
 name: oh-coage
-description: 使用可配置站点的 GPT-Image 系列 API 生成图片，支持文生图和图生图，并可在 gpt-image-2 / gpt-image-2.5-sunburst / gpt-image-2.5-flare 三个内置模型间切换或自定义模型。当用户说"生图"、"画图"、"生成图片"、"oh-coage"、"gpt-image"、"Image2 生图"、"帮我画"、"用 gpt 画"、"用 2.5 画"、"换个模型画"、"把这张图改成"、"参考这张图"等涉及 AI 图片生成或图片编辑的请求时触发此技能。首次使用时先做本地初始化：收集图片总保存目录、profile 名、站点 URL 和 API Key；支持聊天问答和可视化表单两种初始化方式；Key 写入本机 Keychain，本地配置文件只保存非敏感信息。
+description: 使用可配置站点的 GPT-Image 系列 API 生成图片，支持文生图和图生图，并可在 gpt-image-2 / gpt-image-2.5-sunburst / gpt-image-2.5-flare 三个内置模型间切换或自定义模型。当用户说"生图"、"画图"、"生成图片"、"oh-coage"、"gpt-image"、"Image2 生图"、"帮我画"、"用 gpt 画"、"用 2.5 画"、"切换模型"、"换模型"、"换个模型"、"改成 xxx 模型"、"使用 xxx 模型"、"有哪些模型"、"把这张图改成"、"参考这张图"等涉及 AI 图片生成、图片编辑或模型切换的请求时触发此技能。首次使用时先做本地初始化：收集图片总保存目录、profile 名、站点 URL 和 API Key；支持聊天问答和可视化表单两种初始化方式；Key 写入本机 Keychain，本地配置文件只保存非敏感信息。
 ---
 
 # oh-coage（入口指针）

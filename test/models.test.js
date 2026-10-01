@@ -84,3 +84,26 @@ test('isBuiltinModelKey guards built-in models from deletion', () => {
   assert.equal(isBuiltinModelKey('IMAGE-2.5-SUNBURST'), true);
   assert.equal(isBuiltinModelKey('my-model'), false);
 });
+
+test('resolveModel accepts the distinctive suffix of a model name', () => {
+  assert.equal(resolveModel('flare', {}).model, 'gpt-image-2.5-flare');
+  assert.equal(resolveModel('FLARE', {}).model, 'gpt-image-2.5-flare');
+  assert.equal(resolveModel('sunburst', {}).model, 'gpt-image-2.5-sunburst');
+  assert.equal(resolveModel('flare', {}).source, 'suffix');
+
+  // 无意义的片段不该被当成后缀匹配
+  assert.throws(() => resolveModel('fl', {}), /未知模型/);
+  assert.throws(() => resolveModel('5', {}), /未知模型/);
+});
+
+test('suffix matching refuses to guess when a custom model makes it ambiguous', () => {
+  const custom = { 'my-flare': { model: 'vendor-flare' } };
+
+  assert.throws(() => resolveModel('flare', custom), /匹配到多个模型/);
+  assert.throws(() => resolveModel('flare', custom), /my-flare/);
+  assert.throws(() => resolveModel('flare', custom), /image-2\.5-flare/);
+
+  // 写全名就还是唯一的
+  assert.equal(resolveModel('image-2.5-flare', custom).model, 'gpt-image-2.5-flare');
+  assert.equal(resolveModel('my-flare', custom).model, 'vendor-flare');
+});

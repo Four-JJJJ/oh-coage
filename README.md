@@ -154,6 +154,9 @@ ln -s "/path/to/oh-coage/skills/oh-coage" ~/.claude/skills/oh-coage
 - image edit
 - oh-coage
 - gpt-image
+- 切换模型 / 换模型 / 换个模型
+- 改成 xxx 模型 / 使用 xxx 模型 / 以后都用 xxx 画
+- 有哪些模型 / 当前是什么模型
 
 ## 首次使用流程
 
@@ -504,6 +507,31 @@ node "$SKILL_DIR/scripts/generate.js" \
 ```bash
 node "$SKILL_DIR/scripts/generate.js" --model "gpt-image-2.5-flare" --prompt "..."
 ```
+
+### 切换模型的说法
+
+改默认模型（持久生效）：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --model "image-2.5-flare"
+```
+
+只改这一次，不动配置：
+
+```bash
+node "$SKILL_DIR/scripts/generate.js" --model "image-2.5-flare" --prompt "..."
+```
+
+`--model` 接受完整短名、完整 model ID，也接受**唯一的后半截名字**：
+
+| 你写的 | 解析成 |
+|---|---|
+| `image-2.5-flare` | `gpt-image-2.5-flare` |
+| `gpt-image-2.5-flare` | `gpt-image-2.5-flare` |
+| `flare` | `gpt-image-2.5-flare` |
+| `sunburst` | `gpt-image-2.5-sunburst` |
+
+后半截匹配只在**能唯一确定**时生效。如果匹配到多个（比如你加了一个也叫 `-flare` 的自定义模型），脚本会报错并列出候选，不会替你选。
 
 ### `2.5` 为什么不直接选
 

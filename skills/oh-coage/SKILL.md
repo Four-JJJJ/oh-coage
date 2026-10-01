@@ -1,6 +1,6 @@
 ---
 name: oh-coage
-description: 使用可配置站点的 GPT-Image 系列 API 生成图片，支持文生图和图生图，并可在 gpt-image-2 / gpt-image-2.5-sunburst / gpt-image-2.5-flare 三个内置模型间切换或自定义模型。当用户说"生图"、"画图"、"生成图片"、"oh-coage"、"gpt-image"、"Image2 生图"、"帮我画"、"用 gpt 画"、"用 2.5 画"、"换个模型画"、"把这张图改成"、"参考这张图"等涉及 AI 图片生成或图片编辑的请求时触发此技能。首次使用时先做本地初始化：收集图片总保存目录、profile 名、站点 URL 和 API Key；支持聊天问答和可视化表单两种初始化方式；Key 写入本机 Keychain，本地配置文件只保存非敏感信息。
+description: 使用可配置站点的 GPT-Image 系列 API 生成图片，支持文生图和图生图，并可在 gpt-image-2 / gpt-image-2.5-sunburst / gpt-image-2.5-flare 三个内置模型间切换或自定义模型。当用户说"生图"、"画图"、"生成图片"、"oh-coage"、"gpt-image"、"Image2 生图"、"帮我画"、"用 gpt 画"、"用 2.5 画"、"切换模型"、"换模型"、"换个模型"、"改成 xxx 模型"、"使用 xxx 模型"、"有哪些模型"、"把这张图改成"、"参考这张图"等涉及 AI 图片生成、图片编辑或模型切换的请求时触发此技能。首次使用时先做本地初始化：收集图片总保存目录、profile 名、站点 URL 和 API Key；支持聊天问答和可视化表单两种初始化方式；Key 写入本机 Keychain，本地配置文件只保存非敏感信息。
 ---
 
 # GPT-Image 图片生成
@@ -68,6 +68,42 @@ node "$SKILL_DIR/scripts/setup.js" --model "image-2.5-flare"
 ```bash
 node "$SKILL_DIR/scripts/generate.js" --model "image-2.5-sunburst" --prompt "用户的提示词"
 ```
+
+### 用户想换模型时
+
+用户说「切换模型」「换模型」「换个模型」「改成 xxx 模型」「使用 xxx 模型」「以后都用 xxx 画」「有哪些模型」这类话时，按下面三步走。
+
+**第 1 步：是「改默认」还是「只这一次」**
+
+- 「以后都用 / 默认用 / 换成 / 切换成 / 改用 xxx」→ 改默认，用 `setup.js --model`（持久生效）
+- 「这次 / 这张 / 用 xxx 画这一张」→ 只这一次，用 `generate.js --model`（不改配置）
+
+拿不准时按**持久切换**处理，并在回复里说明「已切换默认模型」。
+
+**第 2 步：用户有没有点名模型**
+
+- **点名了就不要再问**，直接切。允许只叫后半截名字，脚本会唯一匹配：
+  - 「用 flare 画」→ `--model flare` → `gpt-image-2.5-flare`
+  - 「用 sunburst」→ `--model sunburst` → `gpt-image-2.5-sunburst`
+  - 完整短名（`image-2.5-flare`）和完整 model ID（`gpt-image-2.5-flare`）也都接受
+- **只说要换、没点名**（「换个模型」）→ 先列出来让用户选，不要擅自替他选：
+
+  ```bash
+  node "$SKILL_DIR/scripts/setup.js" --list-models
+  ```
+
+  把结果整理成选项发给他，等选定后再执行切换。
+- **说了「2.5」这种不完整的** → 必须问清是 `sunburst` 还是 `flare`。脚本会直接报错并列出两个候选，你要把这个选择转达给用户，**不要自己猜**。
+- **拼错或不存在** → 脚本会报错并列出全部可用模型，把可选值转达给用户重选。
+
+**第 3 步：报结果**
+
+切换完成后告诉用户当前模型，**用完整 model ID**（例如 `gpt-image-2.5-flare`），不要只说短名或「2.5」。
+
+**两个容易混的地方**
+
+- 「把这张图改成水彩风格」是**改图**，走 `generate.js --image-url`；「把模型改成 flare」才是换模型。靠宾语区分。
+- 换模型默认是**全局**的，影响之后所有生成。用户说「只让某个站点 / 某个 profile 用这个模型」时，用 `--profile-model`，不要用 `--model`。
 
 ### 模型优先级
 
