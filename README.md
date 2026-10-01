@@ -108,7 +108,7 @@ codex plugin add oh-coage@oh-coage
 `--ref main` 跟随最新提交。如果你想要可复现的稳定版本，改用已发布的 tag（版本号见 [Releases](https://github.com/Four-JJJJ/oh-coage/releases)）：
 
 ```bash
-codex plugin marketplace add Four-JJJJ/oh-coage --ref v0.2.0
+codex plugin marketplace add Four-JJJJ/oh-coage --ref v0.3.0
 codex plugin add oh-coage@oh-coage
 ```
 
