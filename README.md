@@ -2,7 +2,7 @@
 
 一个给 Codex / Claude Code / 其他 AI coding agent 使用的图片生成 skill。
 
-这个 skill 固定使用 `gpt-image-2` 模型，但不绑定某一家站点。它支持你在**首次使用时本地初始化**：
+这个 skill 默认使用 `gpt-image-2`，并内置另外两个模型可选，也支持你自己追加模型；但不绑定某一家站点。它支持你在**首次使用时本地初始化**：
 
 - 让用户先决定图片总保存目录
 - 让用户填写站点 `base_url`
@@ -14,7 +14,7 @@
 
 ## 功能概览
 
-- 模型固定：`gpt-image-2`
+- 模型可选：3 个内置模型 + 自定义模型，可持久切换
 - 首次使用初始化
 - 默认本地保存图片
 - 多 profile 管理
@@ -30,13 +30,21 @@
 
 ```text
 .
-├── SKILL.md
+├── SKILL.md                  # 入口指针（仓库根作为 skill 目录时使用）
 ├── README.md
-└── scripts
-    ├── config-store.js
-    ├── generate.js
-    └── setup.js
+└── skills/oh-coage/          # skill 实体，自包含
+    ├── SKILL.md              # 唯一权威文档
+    ├── assets/
+    │   └── oh-coage-init-form.html
+    └── scripts/
+        ├── config-store.js
+        ├── generate.js
+        ├── models.js
+        ├── resolve-output-dir.js
+        └── setup.js
 ```
+
+`skills/oh-coage/` 是可以整体拷走或软链的完整 skill 目录，`SKILL.md`、`scripts/`、`assets/` 三者同级。下文命令中的 `$SKILL_DIR` 即指这个目录。
 
 ## 运行要求
 
@@ -82,8 +90,10 @@ node -v
 ```text
 .
 ├── .codex-plugin/plugin.json
+├── .agents/plugins/marketplace.json
 ├── skills/oh-coage/SKILL.md
-└── scripts/
+├── skills/oh-coage/assets/
+└── skills/oh-coage/scripts/
 ```
 
 ### Codex plugin
@@ -106,15 +116,19 @@ codex plugin add oh-coage@oh-coage
 
 ### 传统 skill
 
-如果只按旧方式使用，也可以把这个仓库作为 skill 安装到你的 agent skills 目录。
-
-例如：
+先把仓库克隆到本地固定位置：
 
 ```bash
 git clone https://github.com/Four-JJJJ/oh-coage.git
 ```
 
-然后按你自己的 agent 规范，把它放到可触发的 skills 目录中。
+**推荐做法**：把 `skills/oh-coage` 这个自包含目录软链到你的 agent skills 目录。这样 `$SKILL_DIR` 就指向 skill 实体，文档里的 `$SKILL_DIR/scripts/...` 天然正确。
+
+```bash
+ln -s "/path/to/oh-coage/skills/oh-coage" ~/.claude/skills/oh-coage
+```
+
+**另一种做法**：把仓库根目录本身当作 skill 目录。此时根目录的 `SKILL.md` 只是入口指针，会把你导向 `skills/oh-coage/SKILL.md`；按该文件的说明，你需要把 `skills/oh-coage/` 视为 `$SKILL_DIR`。
 
 ## Skill 触发场景
 
@@ -136,9 +150,11 @@ git clone https://github.com/Four-JJJJ/oh-coage.git
 
 第一次使用时，不要直接调用生成脚本，先初始化。
 
-在 Codex 插件模式下，初始化会优先展示一个可交互表单，填写 profile、站点 URL 和 API Key 后提交。图片保存目录会自动使用当前项目根目录；没有项目上下文时默认使用桌面，也可以手动修改路径。表单不可用时才回退到聊天输入。
+在支持 inline HTML 渲染的 Codex 类环境里，初始化会优先展示一个可交互表单，填写 profile、站点 URL 和 API Key 后提交。图片保存目录会自动使用当前项目根目录；没有项目上下文时默认使用桌面，也可以手动修改路径。
 
-应先询问用户这 4 个值：
+其他环境（普通 CLI agent、终端类宿主）不具备表单能力，会直接回退到聊天输入这一基线路径。判定方式是**先看能力再选路径**，不是先试表单再回退。
+
+无论走哪条路径，最终都需要这 4 个值：
 
 1. 图片总保存到哪个文件夹
 2. profile 名称是什么
@@ -222,6 +238,7 @@ node "$SKILL_DIR/scripts/generate.js" \
 默认行为：
 
 - 读取当前 active profile
+- 使用配置文件里的当前模型（`--model` 可单次覆盖）
 - 自动从 Keychain 读取该 profile 的 key
 - 优先调用当前 active profile，对可重试错误会自动 fallback 到下一个可用 profile
 - 生成成功后先在该 profile 的总目录下创建一个时间命名子文件夹，再把图片保存进去
@@ -269,6 +286,9 @@ node "$SKILL_DIR/scripts/generate.js" [options]
 
 - `--prompt`
   - 必填，图片提示词
+- `--model`
+  - 可选，本次使用的模型，接受短名或原始 model ID
+  - 不传则用配置文件里的当前模型，再退回默认 `image-2`
 - `--profile`
   - 可选，临时指定本次生成使用哪个 profile
 - `--size`
@@ -311,7 +331,19 @@ node "$SKILL_DIR/scripts/setup.js" [options]
 - `--health-check`
   - 检查所有 profile 的本地配置健康度
 - `--live`
-  - 与 `--health-check` 配合使用，增加一次低成本在线可达性探测
+  - 与 `--health-check` 配合使用，增加一次低成本可达性探测
+- `--list-models`
+  - 列出所有可用模型，并标出当前模型
+- `--model`
+  - 切换当前模型，写入配置文件并持续生效
+- `--add-model`
+  - 添加或更新一个自定义模型的短名
+- `--model-id`
+  - 配合 `--add-model`，指定该短名对应的真实 model ID
+- `--label`
+  - 可选，配合 `--add-model` 给自定义模型加一句说明
+- `--delete-model`
+  - 删除一个自定义模型（内置模型不可删）
 
 ## 多 profile 管理
 
@@ -402,6 +434,7 @@ node "$SKILL_DIR/scripts/setup.js" --uninstall-skill
 - 删除 `~/.oh-coage/state.json`
 - 删除当前配置文件
 - 删除所有 profile 对应的 Keychain 记录
+- **保留** `~/.oh-coage/runs.jsonl`（里面有历史 prompt，可能还要追溯）
 - 不删除 skill 仓库目录本身
 
 如果你只想部分清理：
@@ -413,6 +446,90 @@ node "$SKILL_DIR/scripts/setup.js" --uninstall-skill --keep-config-file
 ```bash
 node "$SKILL_DIR/scripts/setup.js" --uninstall-skill --keep-keychain
 ```
+
+如果你连运行日志也要一起清掉：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --uninstall-skill --purge-logs
+```
+
+## 模型选择
+
+内置 3 个模型：
+
+| 短名 | 实际发给接口的 model ID | 说明 |
+|---|---|---|
+| `image-2` | `gpt-image-2` | 默认模型 |
+| `image-2.5-sunburst` | `gpt-image-2.5-sunburst` | 2.5 系列 |
+| `image-2.5-flare` | `gpt-image-2.5-flare` | 2.5 系列 |
+
+### 查看可选模型
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --list-models
+```
+
+### 切换模型（持久生效）
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --model "image-2.5-flare"
+```
+
+切换后会写进配置文件，**后续每次生成都用这个模型，直到你再次切换**。
+
+### 单次临时指定
+
+```bash
+node "$SKILL_DIR/scripts/generate.js" \
+  --model "image-2.5-sunburst" \
+  --prompt "a minimal poster"
+```
+
+`--model` 只影响这一次，不改动持久配置，优先级高于配置里的当前模型。
+
+也可以直接传原始 model ID：
+
+```bash
+node "$SKILL_DIR/scripts/generate.js" --model "gpt-image-2.5-flare" --prompt "..."
+```
+
+### `2.5` 为什么不直接选
+
+`2.5`、`image-2.5`、`gpt-image-2.5` 都属于**歧义输入**。脚本会拒绝执行并列出两个候选，而不是替你猜——这两个模型的档位不同，猜错会白花一次配额。请显式写 `image-2.5-sunburst` 或 `image-2.5-flare`。
+
+### 添加自定义模型
+
+如果你的站点还有别的模型，先向服务方确认它要求的准确 model ID 字符串，然后：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" \
+  --add-model "my-model" \
+  --model-id "vendor-model-id" \
+  --label "我的模型"
+```
+
+之后就能像内置模型一样使用：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --model "my-model"
+```
+
+删除：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --delete-model "my-model"
+```
+
+约束：
+
+- 内置模型不允许删除
+- 自定义短名不能与内置短名重名
+- 删掉的正是当前模型时，会自动回到 `image-2`
+- 添加时不给 `--model-id` 会被拦下，并提示你向用户确认 model ID
+
+### 模型是全局设置
+
+模型不分 profile。如果多个站点支持的模型不同，fallback 到不支持该模型的站点时接口会报错——这种情况下用 `--model` 指定该站点支持的模型，或把不支持的 profile 设成 `"enabled": false`。
 
 ## 比例和分辨率建议
 
@@ -455,6 +572,9 @@ node "$SKILL_DIR/scripts/setup.js" --uninstall-skill --keep-keychain
 如果接口返回的是：
 
 - 图片 URL：脚本会自动下载再保存
+  - 会跟随 301/302/303/307/308 跳转（最多 5 跳），适配「生成接口给短链、真实图在 CDN」的常见结构
+  - 扩展名按响应 `content-type` 校正，不靠 URL 猜
+  - 下载中断时会删掉残缺文件，不会给你留下一张看起来正常、实际打不开的空图
 - base64：脚本会直接解码为本地图片文件
 
 ## 临时覆盖机制
@@ -474,6 +594,30 @@ node "$SKILL_DIR/scripts/generate.js" \
 - 临时测试新站点
 - 临时切换 key
 - 不想改当前默认 profile
+
+### 环境变量
+
+除命令行参数外，也认这两个环境变量（优先级低于显式参数）：
+
+- `IMAGES2_GEN_API_KEY`
+- `IMAGES2_GEN_BASE_URL`
+
+适合在 CI 或临时脚本里注入，不必把 key 写进命令行。注意：这只覆盖单次运行，不会写入配置文件。
+
+### profile 优先级
+
+每个 profile 可以带一个可选的 `priority` 数字字段，写在配置文件里：
+
+```json
+{
+  "profiles": {
+    "main": { "base_url": "https://a.example/v1", "root_output_dir": ".", "priority": 10 },
+    "backup": { "base_url": "https://b.example/v1", "root_output_dir": ".", "priority": 20 }
+  }
+}
+```
+
+数字小的先尝试。不写时默认为 `100`。当前 active profile 和被 `--profile` 指定的 profile 永远优先于 `priority`。
 
 ## 异步任务回收
 
@@ -495,8 +639,9 @@ node "$SKILL_DIR/scripts/generate.js" \
 - 如果指定了 `--profile`，优先从该 profile 开始
 - 其他 profile 作为后续候选
 
-遇到下面这类错误，会自动切到下一个候选 profile：
+遇到下面这类错误，会**先在当前 profile 上退避重试一次**，仍然失败才切到下一个候选 profile：
 
+- `500`
 - `502`
 - `503`
 - `504`
@@ -507,8 +652,11 @@ node "$SKILL_DIR/scripts/generate.js" \
 
 其中：
 
-- `429` 会先在当前 profile 上做短暂退避重试
-- `401` / `403` 会直接判定该 profile 当前不可用
+- `429` 退避 `1.5s × 重试次数`，其余可重试错误退避 `1s × 重试次数`
+- `401` / `403` 不重试，直接判定该 profile 当前不可用并切换
+- Keychain 里读不到某个 profile 的 key 时，只跳过该 profile，不会中断整轮
+- `base_url` 协议不是 `http`/`https` 的 profile，会在开始尝试前就被跳过并提示
+- 异步任务轮询期间遇到可重试错误，也会在同一个任务上重试，最多连续失败 3 次
 
 如果你想禁用自动 fallback：
 
@@ -531,10 +679,13 @@ node "$SKILL_DIR/scripts/generate.js" \
 - 开始时间
 - prompt 摘要
 - 使用的 profile
+- 使用的模型（`model` / `model_key` / `model_source`）
 - 每次尝试的错误码 / 错误类型
 - 最终是否成功
 - 保存路径
 - 总耗时
+
+错误正文会被截断到 500 字符再落盘，避免上游返回的大段 HTML 或 base64 把日志撑爆。
 
 ## 安全说明
 
@@ -620,6 +771,27 @@ node "$SKILL_DIR/scripts/setup.js" \
 4. 需要切换站点时：
    - 临时切换：生成时传 `--profile`
    - 长期切换：`setup.js --activate-profile`
+
+## 开发与测试
+
+需要 Node.js `>= 18`。
+
+```bash
+npm run check   # 四个脚本的语法检查
+npm test        # 全部测试（node --test）
+```
+
+测试不依赖真实站点，也不写真实 Keychain：全部用本地 mock HTTP 服务 + 临时 `HOME` 目录跑。
+
+覆盖范围包括：
+
+- 配置文件读写、相对路径解析、派生字段不落盘
+- 模型注册表解析、歧义拒绝、自定义模型增删、当前模型持久切换
+- 图生图本地上传、缺失参考图报错
+- 下载跟随跳转、扩展名按 `content-type` 纠正、失败清理残文件
+- 异步任务轮询节奏、瞬时故障重试、终态识别、结构非法快速失败
+- 5xx 同 profile 重试、Keychain 读取失败 fallback、非法 `base_url` 拒绝
+- 初始化表单结构、skill 目录自包含性、文档引用可达性
 
 ## Acknowledgements
 

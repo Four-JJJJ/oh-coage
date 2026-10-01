@@ -7,7 +7,7 @@ const { spawn } = require('node:child_process');
 const test = require('node:test');
 
 const repoRoot = path.resolve(__dirname, '..');
-const generatePath = path.join(repoRoot, 'scripts', 'generate.js');
+const generatePath = path.join(repoRoot, 'skills', 'oh-coage', 'scripts', 'generate.js');
 
 function createTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'oh-coage-test-'));
@@ -125,8 +125,8 @@ test('generate reports a clear error for missing local image-url paths', async (
 test('pollTask uses an increasing recovery schedule for async image tasks', async () => {
   const previousTestFlag = process.env.OH_COAGE_TEST;
   process.env.OH_COAGE_TEST = '1';
-  delete require.cache[require.resolve('../scripts/generate')];
-  const { pollTask, POLL_DELAYS_MS } = require('../scripts/generate');
+  delete require.cache[require.resolve('../skills/oh-coage/scripts/generate')];
+  const { pollTask, POLL_DELAYS_MS } = require('../skills/oh-coage/scripts/generate');
   if (previousTestFlag === undefined) {
     delete process.env.OH_COAGE_TEST;
   } else {

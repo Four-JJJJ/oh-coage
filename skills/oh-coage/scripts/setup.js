@@ -11,7 +11,9 @@ const http = require('http');
 const {
   APP_DIR,
   STATE_PATH,
+  RUNS_PATH,
   normalizeBaseUrl,
+  assertValidBaseUrl,
   loadActiveConfig,
   saveState,
   getDefaultConfigPath,
@@ -23,6 +25,14 @@ const {
   setActiveProfile,
   ensureDir,
 } = require('./config-store');
+const {
+  DEFAULT_MODEL_KEY,
+  buildModelCatalog,
+  resolveModel,
+  resolveConfiguredModel,
+  isBuiltinModelKey,
+  normalizeModelInput,
+} = require('./models');
 
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -43,6 +53,13 @@ function parseArgs() {
       case '--uninstall-skill': parsed.uninstallSkill = true; break;
       case '--keep-config-file': parsed.keepConfigFile = true; break;
       case '--keep-keychain': parsed.keepKeychain = true; break;
+      case '--purge-logs': parsed.purgeLogs = true; break;
+      case '--model': parsed.model = args[++i]; break;
+      case '--list-models': parsed.listModels = true; break;
+      case '--add-model': parsed.addModel = args[++i]; break;
+      case '--model-id': parsed.modelId = args[++i]; break;
+      case '--label': parsed.label = args[++i]; break;
+      case '--delete-model': parsed.deleteModel = args[++i]; break;
       case '--health-check': parsed.healthCheck = true; break;
       case '--live': parsed.live = true; break;
     }
@@ -64,9 +81,17 @@ function printUsage() {
   console.error('  重命名 profile:');
   console.error('    node setup.js --rename-profile "old-name" --to "new-name"');
   console.error('  删除 skill 本地配置和 Keychain 记录:');
-  console.error('    node setup.js --uninstall-skill [--keep-config-file] [--keep-keychain]');
+  console.error('    node setup.js --uninstall-skill [--keep-config-file] [--keep-keychain] [--purge-logs]');
   console.error('  profile 健康检查:');
   console.error('    node setup.js --health-check [--live]');
+  console.error('  查看当前模型和所有可选模型:');
+  console.error('    node setup.js --list-models');
+  console.error('  切换当前模型:');
+  console.error('    node setup.js --model "image-2.5-flare"');
+  console.error('  添加或更新自定义模型:');
+  console.error('    node setup.js --add-model "my-model" --model-id "vendor-model-id" [--label "说明"]');
+  console.error('  删除自定义模型:');
+  console.error('    node setup.js --delete-model "my-model"');
 }
 
 function requireConfig() {
@@ -85,6 +110,7 @@ function listProfiles() {
   }
 
   console.log(`config: ${configPath}`);
+  console.log(`current_model: ${resolveConfiguredModel(config).key}`);
   Object.entries(config.profiles || {}).forEach(([name, profile]) => {
     const flag = name === config.active_profile ? '*' : ' ';
     console.log(`${flag} ${name} -> ${profile.base_url} -> ${profile.root_output_dir || profile.output_dir}`);
@@ -108,7 +134,9 @@ function probeUrl(url, timeoutMs = 8000) {
 
 async function healthCheck(options) {
   const { config, configPath } = requireConfig();
+  const currentModel = resolveConfiguredModel(config);
   console.log(`config: ${configPath}`);
+  console.log(`current_model: ${currentModel.key} -> ${currentModel.model}`);
   console.log(`mode: ${options.live ? 'live' : 'local'}`);
 
   const names = Object.keys(config.profiles || {});
@@ -134,7 +162,7 @@ async function healthCheck(options) {
 
     try {
       const baseUrl = normalizeBaseUrl(profile.base_url);
-      new URL(baseUrl);
+      assertValidBaseUrl(baseUrl);
       checks.push({ item: 'base_url', ok: true, detail: baseUrl });
 
       if (options.live) {
@@ -172,11 +200,114 @@ function activateProfile(profileName) {
   console.log(`已切换当前 profile: ${profileName}`);
 }
 
+function listModels() {
+  const { config } = loadActiveConfig();
+  const catalog = buildModelCatalog(config?.custom_models);
+  const current = resolveConfiguredModel(config);
+
+  console.log(`current_model: ${current.key} -> ${current.model}`);
+  if (!config) {
+    console.log('（尚未初始化，以下仅为内置模型）');
+  }
+
+  catalog.forEach((entry) => {
+    const flag = entry.key === current.key ? '*' : ' ';
+    console.log(`${flag} ${entry.key} -> ${entry.model}${entry.builtin ? '' : '（自定义）'}`);
+  });
+}
+
+function switchModel(modelInput) {
+  if (!modelInput) {
+    printUsage();
+    process.exit(1);
+  }
+
+  const { config, configPath } = requireConfig();
+  const resolved = resolveModel(modelInput, config.custom_models);
+
+  config.current_model = resolved.key;
+  config.updated_at = new Date().toISOString();
+  saveConfig(configPath, config);
+
+  console.log(`已切换当前模型: ${resolved.key} -> ${resolved.model}`);
+  console.log('后续生成都会使用这个模型，直到你再次切换。');
+}
+
+function addCustomModel(options) {
+  const key = normalizeModelInput(options.addModel);
+  if (!key) {
+    printUsage();
+    process.exit(1);
+  }
+
+  if (isBuiltinModelKey(key)) {
+    throw new Error(`短名 ${key} 与内置模型冲突，请换一个短名（例如 ${key}-custom）。`);
+  }
+
+  if (!options.modelId) {
+    throw new Error(
+      '缺少 --model-id：添加自定义模型前，必须先向用户确认该站点要求的 model ID 字符串。\n'
+      + '示例：node setup.js --add-model "my-model" --model-id "vendor-model-id" [--label "说明"]',
+    );
+  }
+
+  const { config, configPath } = requireConfig();
+  config.custom_models ||= {};
+  const existed = Boolean(config.custom_models[key]);
+
+  config.custom_models[key] = {
+    model: options.modelId,
+    ...(options.label ? { label: options.label } : {}),
+    updated_at: new Date().toISOString(),
+  };
+  config.updated_at = new Date().toISOString();
+  saveConfig(configPath, config);
+
+  console.log(`已${existed ? '更新' : '添加'}自定义模型: ${key} -> ${options.modelId}`);
+  console.log(`切换到这个模型：node setup.js --model "${key}"`);
+}
+
+function deleteCustomModel(modelInput) {
+  const key = normalizeModelInput(modelInput);
+  if (!key) {
+    printUsage();
+    process.exit(1);
+  }
+
+  if (isBuiltinModelKey(key)) {
+    throw new Error(`内置模型 ${key} 不能删除。`);
+  }
+
+  const { config, configPath } = requireConfig();
+  if (!config.custom_models?.[key]) {
+    throw new Error(`自定义模型不存在: ${key}`);
+  }
+
+  delete config.custom_models[key];
+  if (Object.keys(config.custom_models).length === 0) {
+    delete config.custom_models;
+  }
+
+  if (config.current_model === key) {
+    config.current_model = DEFAULT_MODEL_KEY;
+    console.log(`被删除的模型正是当前模型，已回到默认: ${DEFAULT_MODEL_KEY}`);
+  }
+
+  config.updated_at = new Date().toISOString();
+  saveConfig(configPath, config);
+
+  console.log(`已删除自定义模型: ${key}`);
+}
+
 function upsertProfile(options) {
   if (!options.outputDir || !options.profile || !options.baseUrl || !options.apiKey) {
     printUsage();
     process.exit(1);
   }
+
+  // 存进去之前就拦住非法 base_url，别等到生成时才发现
+  const normalizedBaseUrl = normalizeBaseUrl(options.baseUrl);
+  assertValidBaseUrl(normalizedBaseUrl);
 
   ensureDir(options.outputDir);
 
@@ -186,14 +317,19 @@ function upsertProfile(options) {
     version: 1,
     created_at: new Date().toISOString(),
     active_profile: options.profile,
+    current_model: DEFAULT_MODEL_KEY,
     profiles: {},
   };
+
+  if (!config.current_model) {
+    config.current_model = DEFAULT_MODEL_KEY;
+  }
 
   const keychainAccount = config.profiles[options.profile]?.keychain_account || buildKeychainAccount(options.profile, configPath);
   saveKeychainSecret(keychainAccount, options.apiKey);
 
   config.profiles[options.profile] = {
-    base_url: normalizeBaseUrl(options.baseUrl),
+    base_url: normalizedBaseUrl,
     root_output_dir: options.outputDir,
     keychain_account: keychainAccount,
     updated_at: new Date().toISOString(),
@@ -310,6 +446,11 @@ function uninstallSkill(options) {
     fs.unlinkSync(configPath);
   }
 
+  // 运行日志里有历史 prompt，默认保留，只有显式要求时才清
+  if (options.purgeLogs && fs.existsSync(RUNS_PATH)) {
+    fs.unlinkSync(RUNS_PATH);
+  }
+
   if (fs.existsSync(APP_DIR) && fs.readdirSync(APP_DIR).length === 0) {
     fs.rmdirSync(APP_DIR);
   }
@@ -318,6 +459,7 @@ function uninstallSkill(options) {
   console.log(`state 文件: ${fs.existsSync(STATE_PATH) ? '保留' : '已删除'}`);
   console.log(`config 文件: ${options.keepConfigFile ? '保留' : '已删除或不存在'}`);
   console.log(`Keychain 记录: ${options.keepKeychain ? '保留' : `已删除 ${deletedKeychainCount} 条`}`);
+  console.log(`运行日志: ${fs.existsSync(RUNS_PATH) ? '保留（含历史 prompt，如需一并删除请加 --purge-logs）' : '已删除或不存在'}`);
   console.log('说明：此命令不会删除 skill 仓库目录本身；如需移除仓库，请由用户自行删除该文件夹。');
 }
 
@@ -326,6 +468,26 @@ function main() {
 
   if (options.list) {
     listProfiles();
+    return;
+  }
+
+  if (options.listModels) {
+    listModels();
+    return;
+  }
+
+  if (options.model) {
+    switchModel(options.model);
+    return;
+  }
+
+  if (options.addModel) {
+    addCustomModel(options);
+    return;
+  }
+
+  if (options.deleteModel) {
+    deleteCustomModel(options.deleteModel);
     return;
   }
 

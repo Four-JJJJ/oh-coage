@@ -1,13 +1,14 @@
 ---
 name: oh-coage
-description: 使用可配置站点的 GPT-Image-2 API 生成图片，支持文生图和图生图。当用户说"生图"、"画图"、"生成图片"、"oh-coage"、"gpt-image"、"Image2 生图"、"帮我画"、"用 gpt 画"、"把这张图改成"、"参考这张图"等涉及 AI 图片生成或图片编辑的请求时触发此技能。首次使用时通过可交互表单收集保存目录、profile 名、站点 URL 和 API Key；保存目录默认使用当前项目根目录，没有项目上下文时使用桌面；Key 写入本机 Keychain，本地配置文件只保存非敏感信息。
+description: 使用可配置站点的 GPT-Image 系列 API 生成图片，支持文生图和图生图，并可在 gpt-image-2 / gpt-image-2.5-sunburst / gpt-image-2.5-flare 三个内置模型间切换或自定义模型。当用户说"生图"、"画图"、"生成图片"、"oh-coage"、"gpt-image"、"Image2 生图"、"帮我画"、"用 gpt 画"、"用 2.5 画"、"换个模型画"、"把这张图改成"、"参考这张图"等涉及 AI 图片生成或图片编辑的请求时触发此技能。首次使用时先做本地初始化：收集图片总保存目录、profile 名、站点 URL 和 API Key；支持聊天问答和可视化表单两种初始化方式；Key 写入本机 Keychain，本地配置文件只保存非敏感信息。
 ---
 
-# GPT-Image-2 图片生成
+# GPT-Image 图片生成
 
-通过可配置站点的 GPT-Image-2 API 生成图片。模型固定为 `gpt-image-2`。支持：
+通过可配置站点的 GPT-Image 系列 API 生成图片。默认模型 `gpt-image-2`，另有 2 个 2.5 系列模型可选，也支持用户自定义模型。支持：
 
 - 文生图和图生图
+- 模型选择：3 个内置 + 自定义
 - 同步返回和异步任务轮询
 - 默认保存到用户指定目录
 - 多 profile 管理与切换
@@ -15,23 +16,86 @@ description: 使用可配置站点的 GPT-Image-2 API 生成图片，支持文�
 - 运行日志记录
 - API Key 写入本机 Keychain，不写入仓库或普通文本
 
+## 脚本位置
+
+本 skill 是自包含目录，`SKILL.md`、`scripts/`、`assets/` 三者同级：
+
+```text
+<skill 目录>/
+├── SKILL.md
+├── scripts/
+│   ├── config-store.js
+│   ├── generate.js
+│   ├── resolve-output-dir.js
+│   └── setup.js
+└── assets/
+    └── oh-coage-init-form.html
+```
+
+本文所有命令里的 `$SKILL_DIR` 都指这个目录。如果宿主把 `$SKILL_DIR` 设成了别的值，请改用**本 `SKILL.md` 实际所在目录**。
+
+## 模型选择
+
+内置 3 个模型：
+
+| 短名 | model ID |
+|---|---|
+| `image-2` | `gpt-image-2`（默认） |
+| `image-2.5-sunburst` | `gpt-image-2.5-sunburst` |
+| `image-2.5-flare` | `gpt-image-2.5-flare` |
+
+规则：
+
+1. **不指定就用当前模型。** 当前模型存在配置文件里，用 `setup.js --model` 切换后持续生效，直到用户再次切换。
+2. **单次覆盖用 `--model`**，不改动持久配置。
+3. **`2.5` / `image-2.5` / `gpt-image-2.5` 是歧义输入。** 脚本会直接报错并列出两个候选。用户只说「用 2.5 画」时，你要先问清是 `sunburst` 还是 `flare`，**不要替用户猜**——两者是不同档位，猜错会白花一次配额。
+4. **也可以直接传原始 model ID**，例如 `--model gpt-image-2.5-flare`。
+
+查看可用模型与当前模型：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --list-models
+```
+
+切换当前模型（持久生效）：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --model "image-2.5-flare"
+```
+
+单次指定：
+
+```bash
+node "$SKILL_DIR/scripts/generate.js" --model "image-2.5-sunburst" --prompt "用户的提示词"
+```
+
+### 用户要自定义模型时
+
+必须**先向用户问清该站点要求的准确 model ID 字符串**，再执行：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --add-model "my-model" --model-id "vendor-model-id" --label "说明"
+```
+
+不要自己编一个 model ID，也不要用看起来像的字符串凑数。缺少 `--model-id` 时脚本会拒绝执行并给出提示。删除自定义模型用 `--delete-model`；内置模型不可删除。
+
+模型是全局设置，不区分 profile。如果 fallback 到某个不支持当前模型的站点，接口会报错，此时用 `--model` 指定该站点支持的模型。
+
 ## 强制流程
 
 命中这个 skill 后，先执行下面的判定，不能跳步：
 
 1. 检查本机是否已经完成 `oh-coage` 初始化
-2. 如果**没有初始化**
-   第一条用户可见回复必须直接展示初始化表单，表单包含这 4 个必填字段：
-   - 图片总保存到哪个文件夹
-   - profile 名称是什么
-   - 站点 URL 是什么
-   - API Key 是什么
-3. 在未完成初始化前：
+2. 如果**没有初始化**，第一条用户可见回复必须直接进入初始化流程，不要先做别的探索
+3. 初始化方式按环境能力二选一，**先判定能力，再选路径**，不要"先试表单、失败了再回退"：
+   - **增强路径**：仅当环境同时支持 inline HTML 渲染（`visualize` 类能力）**且**存在 `window.openai.sendFollowUpMessage` 时，才渲染表单
+   - **默认路径**：以上任一条件不满足时，直接用文字询问那 4 个值
+4. 在未完成初始化前：
    - 不要先去检查其他生图技能
    - 不要先去寻找其他图像生成路径
    - 不要先尝试调用别的图片工具兜底
    - 不要先告诉用户“我再看看有没有别的可用链路”
-4. 只有在 `oh-coage` 明确不可用，或者用户明确要求不用它时，才允许转向其他生成路径
+5. 只有在 `oh-coage` 明确不可用，或者用户明确要求不用它时，才允许转向其他生成路径
 
 初始化优先级高于探索别的图片工具。用户已经触发了这个 skill，就应该先走这个 skill 自己的真实初始化链路。
 
@@ -64,6 +128,7 @@ description: 使用可配置站点的 GPT-Image-2 API 生成图片，支持文�
 
 应视为可 fallback 的典型错误：
 
+- `500`
 - `502`
 - `503`
 - `504`
@@ -75,25 +140,38 @@ description: 使用可配置站点的 GPT-Image-2 API 生成图片，支持文�
 
 其中：
 
-- `429`：先在当前 profile 上做短暂重试，再考虑切换
-- `401` / `403`：直接判定该 profile 当前不可用
+- 以上可重试错误会先在当前 profile 上退避重试一次，仍失败才切换 profile
+- `401` / `403`：不重试，直接判定该 profile 当前不可用并切换
+- Keychain 读不到 key：只跳过该 profile，不中断整轮
+- `base_url` 协议不是 `http`/`https`：尝试前就跳过该 profile
 
 如果用户显式要求只用某一个 profile，或者显式禁用 fallback，才只跑单 profile。
 
-### 未初始化时的初始化表单
+### 初始化方式一：文字询问（默认路径）
 
-如果检测到未初始化，先运行插件内的 `scripts/resolve-output-dir.js` 得到默认保存目录，再使用内置表单模板 `assets/oh-coage-init-form.html`，按 `visualize` skill 的 inline HTML 流程渲染，并将 `outputDir` 预填为该目录。如果解析结果是项目根目录，将表单根节点的 `data-has-project` 设为 `true`；否则保持 `false` 并将保存目录预填为桌面。第一条回复只需要引导用户填写表单并展示表单，不要先用文字逐项询问，也不要把表单字段预填成真实密钥。
+这是所有环境都必须可用的基线。第一条回复应尽量接近下面这个形式：
 
-表单提交后会发送包含 `OH_COAGE_INIT_FORM_SUBMISSION` 标记的结构化消息。收到这条消息后：
+`当前会先初始化 oh-coage。我需要你提供 4 个值：1. 图片总保存目录 2. profile 名称 3. 站点 URL 4. API Key。`
 
-1. 直接解析表单中的 `outputDir`、`profile`、`baseUrl`、`apiKey`。
-2. 使用插件内的 `scripts/setup.js` 完成本地初始化并加上 `--activate`。
-3. 不要在命令输出、日志、回复或截图中复述 `apiKey`。
-4. 初始化后运行一次 `--health-check`，再报告 profile、保存目录和检查结果。
+不要在这条回复里插入额外的工具探索、替代方案说明或别的链路检查。
+
+### 初始化方式二：可视化表单（仅限支持的环境）
+
+只有在当前环境确实支持 inline HTML 渲染且存在 `window.openai.sendFollowUpMessage` 时才走这条路径。不要把它当作默认路径：在普通 CLI / 终端类 agent 里它不可用，强行渲染只会浪费一轮。
+
+1. 运行 `node "$SKILL_DIR/scripts/resolve-output-dir.js"` 得到默认保存目录
+2. 使用 `assets/oh-coage-init-form.html`，按宿主的 inline HTML 流程渲染，并把 `outputDir` 预填为上一步的结果
+3. 如果解析结果是项目根目录，把表单根节点的 `data-has-project` 设为 `true`；否则保持 `false`，并把保存目录预填为桌面
+4. 第一条回复只引导用户填表并展示表单，不要先用文字逐项询问，也不要把任何字段预填成真实密钥
+
+表单提交后会发来一条包含 `OH_COAGE_INIT_FORM_SUBMISSION` 标记的结构化消息。收到这条消息后：
+
+1. 直接解析其中的 `outputDir`、`profile`、`baseUrl`、`apiKey`
+2. 用 `$SKILL_DIR/scripts/setup.js` 完成本地初始化，并加上 `--activate`
+3. 不要在命令输出、日志、回复或截图中复述 `apiKey`
+4. 初始化后运行一次 `--health-check`，再报告 profile、保存目录和检查结果
 
 保存目录字段默认已经预填。用户可以直接使用当前项目目录或桌面，也可以手动修改该字段；不要在首次初始化时额外打开系统文件夹选择器。
-
-如果当前环境无法渲染或提交可视化表单，才退回聊天询问这 4 个字段。
 
 ### 初始化完成后的确认模板
 
@@ -113,7 +191,7 @@ description: 使用可配置站点的 GPT-Image-2 API 生成图片，支持文�
 
 ## 首次使用初始化
 
-如果用户第一次使用，或者脚本提示“尚未完成 oh-coage 初始化”，先解析默认保存目录并展示 `assets/oh-coage-init-form.html`，不要直接生成图片。只有可视化表单不可用时，才按顺序询问用户：
+如果用户第一次使用，或者脚本提示“尚未完成 oh-coage 初始化”，先按上面的方式判定初始化路径，不要直接生成图片。无论走哪条路径，最终都需要这 4 个值：
 
 1. 图片总保存到哪个文件夹
 2. profile 名称是什么
@@ -123,7 +201,7 @@ description: 使用可配置站点的 GPT-Image-2 API 生成图片，支持文�
 然后运行：
 
 ```bash
- node "$SKILL_DIR/../../scripts/setup.js" \
+node "$SKILL_DIR/scripts/setup.js" \
   --output-dir "/absolute/path/to/save" \
   --profile "default" \
   --base-url "https://your-image-site.example/v1" \
@@ -144,6 +222,12 @@ description: 使用可配置站点的 GPT-Image-2 API 生成图片，支持文�
 
 - 本地配置文件只保存 `base_url`、`root_output_dir`、`keychain_account` 等非敏感字段
 - 不把 key 写进仓库、README、Obsidian、日志或截图
+
+首次初始化时，macOS 可能弹出 Keychain 授权窗口：
+
+- 这是正常行为，因为需要把真实 API Key 写入系统 Keychain
+- 用户需要在弹窗里点“允许”
+- 如果点了“拒绝”或直接关掉弹窗，这次初始化会失败；重新执行一次 `setup.js` 即可
 
 ## 依赖缺失处理
 
@@ -168,7 +252,7 @@ description: 使用可配置站点的 GPT-Image-2 API 生成图片，支持文�
 当用户要求检查当前配置是否可用，或者你准备在多 profile 间排查问题时，使用：
 
 ```bash
-node "$SKILL_DIR/../../scripts/setup.js" --health-check
+node "$SKILL_DIR/scripts/setup.js" --health-check
 ```
 
 默认检查：
@@ -181,7 +265,7 @@ node "$SKILL_DIR/../../scripts/setup.js" --health-check
 如果用户明确允许做一次在线探测，再使用：
 
 ```bash
-node "$SKILL_DIR/../../scripts/setup.js" --health-check --live
+node "$SKILL_DIR/scripts/setup.js" --health-check --live
 ```
 
 `--live` 会增加一次对 `base_url` 的低成本可达性检查。
@@ -191,7 +275,7 @@ node "$SKILL_DIR/../../scripts/setup.js" --health-check --live
 初始化完成后，直接调用：
 
 ```bash
-node "$SKILL_DIR/../../scripts/generate.js" \
+node "$SKILL_DIR/scripts/generate.js" \
   --prompt "用户的提示词" \
   --size "1:1" \
   --resolution "2k"
@@ -200,6 +284,7 @@ node "$SKILL_DIR/../../scripts/generate.js" \
 脚本会自动：
 
 - 读取当前 active profile
+- 使用配置文件里的当前模型（`--model` 可单次覆盖）
 - 从 Keychain 读取该 profile 的 API Key
 - 调用对应 `base_url`
 - 将图片默认保存到该 profile 的总目录下，并自动创建时间命名子文件夹
@@ -208,10 +293,12 @@ node "$SKILL_DIR/../../scripts/generate.js" \
 
 如果接口返回 `task_id`，脚本会自动回收异步任务结果。回收节奏是 `5s -> 10s -> 20s -> 30s -> 60s -> 60s -> 60s`，之后继续以 `60s` 间隔查询，直到达到 5 分钟总超时。
 
+任务终态不只认 `completed` / `failed`，也认 `succeeded`、`done`、`finished`、`error`、`canceled` 等常见写法；轮询期间遇到可重试错误会在同一任务上重试，不会立刻放弃整个任务。
+
 如果用户明确要切换 profile，可在生成时指定：
 
 ```bash
-node "$SKILL_DIR/../../scripts/generate.js" \
+node "$SKILL_DIR/scripts/generate.js" \
   --profile "backup" \
   --prompt "用户的提示词"
 ```
@@ -219,13 +306,13 @@ node "$SKILL_DIR/../../scripts/generate.js" \
 如果用户想长期切换当前默认 profile，运行：
 
 ```bash
-node "$SKILL_DIR/../../scripts/setup.js" --activate-profile "backup"
+node "$SKILL_DIR/scripts/setup.js" --activate-profile "backup"
 ```
 
 如果用户想查看已有 profile，运行：
 
 ```bash
-node "$SKILL_DIR/../../scripts/setup.js" --list
+node "$SKILL_DIR/scripts/setup.js" --list
 ```
 
 如果用户想新增一个 profile，重复运行初始化命令，但换一个 `--profile` 名和对应的 `base_url` / `api_key` 即可。
@@ -233,25 +320,26 @@ node "$SKILL_DIR/../../scripts/setup.js" --list
 如果用户想删除某个 profile，运行：
 
 ```bash
-node "$SKILL_DIR/../../scripts/setup.js" --delete-profile "backup"
+node "$SKILL_DIR/scripts/setup.js" --delete-profile "backup"
 ```
 
 如果用户想重命名某个 profile，运行：
 
 ```bash
-node "$SKILL_DIR/../../scripts/setup.js" --rename-profile "old-name" --to "new-name"
+node "$SKILL_DIR/scripts/setup.js" --rename-profile "old-name" --to "new-name"
 ```
 
 如果用户想删除这个 skill 的本地配置和 Keychain 记录，运行：
 
 ```bash
-node "$SKILL_DIR/../../scripts/setup.js" --uninstall-skill
+node "$SKILL_DIR/scripts/setup.js" --uninstall-skill
 ```
 
 说明：
 
 - 该命令会删除本地 `state.json`
 - 默认也会删除当前配置文件和相关 Keychain 记录
+- 默认**保留** `~/.oh-coage/runs.jsonl`，要一并清掉需加 `--purge-logs`
 - 不会自动删除 skill 仓库目录本身
 - 如果用户要保留配置文件或 Keychain，可加：
   - `--keep-config-file`
@@ -262,7 +350,7 @@ node "$SKILL_DIR/../../scripts/setup.js" --uninstall-skill
 用户提供参考图片时，加上 `--image-url`：
 
 ```bash
-node "$SKILL_DIR/../../scripts/generate.js" \
+node "$SKILL_DIR/scripts/generate.js" \
   --prompt "把这张图改成水彩风格" \
   --image-url "https://example.com/photo.jpg"
 ```
@@ -281,6 +369,9 @@ node "$SKILL_DIR/../../scripts/generate.js" \
 - `resolution` 默认 `2k`
 - 用户说高清或 4K 时优先 `4k`
 - 用户说快速或省钱时优先 `1k`
+- `model` 不传就用当前模型；用户点名某个模型时才传 `--model`
+
+默认模型是 `gpt-image-2`。用户没有提模型时，不要主动换成 2.5 系列——2.5 是不同档位，可能更贵。只有用户明确要求时才切换或指定。
 
 4K 仅支持：`16:9`、`9:16`、`2:1`、`1:2`、`21:9`、`9:21`。不兼容时脚本会自动降为 `2k`。
 

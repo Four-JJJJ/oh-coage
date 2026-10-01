@@ -13,18 +13,28 @@ const {
   DEFAULT_BASE_URL,
   RUNS_PATH,
   normalizeBaseUrl,
+  assertValidBaseUrl,
   loadActiveConfig,
   readKeychainSecret,
   ensureDir,
   appendJsonl,
 } = require('./config-store');
+const { resolveModel, resolveConfiguredModel } = require('./models');
 
 const VALID_4K_SIZES = new Set(['16:9', '9:16', '2:1', '1:2', '21:9', '9:21']);
 const REQUEST_TIMEOUT_MS = 90 * 1000;
 const POLL_TIMEOUT_MS = 20 * 1000;
 const TASK_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_RETRY_ATTEMPTS = 2;
+const MAX_POLL_FAILURES = 3;
+const MAX_REDIRECTS = 5;
+const MAX_ERROR_SNIPPET = 300;
+const MAX_LOG_ERROR_LENGTH = 500;
 const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
+const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308]);
+// 站点各写各的，把常见的终态写法定下来，避免因为不认某个词而空转到 5 分钟超时
+const COMPLETED_TASK_STATUSES = new Set(['completed', 'complete', 'succeeded', 'success', 'done', 'finished']);
+const FAILED_TASK_STATUSES = new Set(['failed', 'failure', 'error', 'canceled', 'cancelled']);
 const POLL_DELAYS_MS = [5, 10, 20, 30, 60, 60, 60].map((seconds) => seconds * 1000);
 const IMAGE_MIME_TYPES = new Map([
   ['.png', 'image/png'],
@@ -54,6 +64,18 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function truncateForLog(value, maxLength = MAX_ERROR_SNIPPET) {
+  const text = String(value ?? '');
+  return text.length > maxLength ? `${text.slice(0, maxLength)}…（已截断，原始 ${text.length} 字符）` : text;
+}
+
+/** 给错误打上标记，让 classifyError 明确知道它是「该换 profile」而不是「无法归类」。 */
+function markFallback(error, kind) {
+  error.fallback = true;
+  if (kind) error.kind = kind;
+  return error;
+}
+
 function parseHttpStatus(error) {
   const match = String(error?.message || '').match(/HTTP\s+(\d{3})/);
   return match ? Number(match[1]) : null;
@@ -63,6 +85,10 @@ function classifyError(error) {
   const message = String(error?.message || '');
   const statusCode = parseHttpStatus(error);
   const lower = message.toLowerCase();
+
+  if (error?.fallback === true) {
+    return { kind: error.kind || 'unknown', statusCode, retryable: false, fallback: true };
+  }
 
   if (statusCode === 401 || statusCode === 403) {
     return { kind: 'auth', statusCode, retryable: false, fallback: true };
@@ -86,18 +112,12 @@ function request(url, options, body, timeoutMs = REQUEST_TIMEOUT_MS) {
       res.on('end', () => {
         const raw = Buffer.concat(chunks).toString('utf-8');
         if (res.statusCode >= 400) {
-          reject(new Error(`HTTP ${res.statusCode}: ${raw}`));
+          reject(new Error(`HTTP ${res.statusCode}: ${truncateForLog(raw)}`));
           return;
         }
 
         if (!raw) {
           resolve(null);
-          return;
-        }
-
-        const contentType = String(res.headers['content-type'] || '');
-        if (contentType.includes('application/json')) {
-          resolve(JSON.parse(raw));
           return;
         }
 
@@ -132,9 +152,9 @@ function extractImagePayload(result) {
   return { imageUrl, base64 };
 }
 
-async function submitGeneration(apiKey, baseUrl, prompt, size, resolution, imageUrls) {
+async function submitGeneration(apiKey, baseUrl, prompt, size, resolution, imageUrls, model) {
   const body = {
-    model: 'gpt-image-2',
+    model,
     prompt,
     n: 1,
     size,
@@ -163,7 +183,20 @@ async function submitGeneration(apiKey, baseUrl, prompt, size, resolution, image
     return { mode: 'sync', image };
   }
 
-  throw new Error(`无法识别生成接口返回结构: ${JSON.stringify(result)}`);
+  throw new Error(`无法识别生成接口返回结构: ${truncateForLog(JSON.stringify(result), MAX_ERROR_SNIPPET)}`);
+}
+
+/**
+ * 轮询响应里的图片可能藏在 {result: {...}} 里，也可能就直接铺在顶层。
+ * 两种形状都试一遍，避免因为站点风格不同而误报「找不到图片结果」。
+ */
+function extractTaskImage(payload) {
+  const fromResult = extractImagePayload({ data: { result: payload?.result } });
+  if (fromResult.imageUrl || fromResult.base64) {
+    return fromResult;
+  }
+
+  return extractImagePayload({ data: payload });
 }
 
 function pollDelayForAttempt(attemptIndex) {
@@ -176,33 +209,66 @@ async function pollTask(apiKey, baseUrl, taskId, options = {}) {
   const now = options.now || Date.now;
   const start = now();
   let pollCount = 0;
+  let consecutiveFailures = 0;
 
   while (true) {
     if (now() - start > TASK_TIMEOUT_MS) {
       throw new Error(`任务超时（超过 ${TASK_TIMEOUT_MS}ms，已轮询 ${pollCount} 次）`);
     }
 
-    const result = await requestFn(`${baseUrl}/tasks/${taskId}`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-    }, null, POLL_TIMEOUT_MS);
+    let payload;
+    try {
+      const result = await requestFn(`${baseUrl}/tasks/${taskId}`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+      }, null, POLL_TIMEOUT_MS);
+
+      payload = result?.data;
+      if (!payload || typeof payload !== 'object') {
+        throw new Error(`任务查询返回结构无法识别: ${truncateForLog(JSON.stringify(result), MAX_ERROR_SNIPPET)}`);
+      }
+
+      consecutiveFailures = 0;
+    } catch (error) {
+      const classification = classifyError(error);
+      consecutiveFailures += 1;
+
+      if (!classification.retryable || consecutiveFailures > MAX_POLL_FAILURES) {
+        // 不可重试（结构非法、鉴权失败），或连续失败过多：交给上层 fallback，避免无限轮询
+        throw markFallback(error, classification.kind);
+      }
+
+      const delay = pollDelayForAttempt(consecutiveFailures - 1);
+      const status = classification.statusCode ? ` ${classification.statusCode}` : '';
+      process.stderr.write(`任务查询失败（${classification.kind}${status}），${Math.round(delay / 1000)}s 后重试（连续失败 ${consecutiveFailures}/${MAX_POLL_FAILURES}）\n`);
+      await sleepFn(delay);
+      continue;
+    }
+
     pollCount += 1;
+    const normalizedStatus = String(payload.status || '').toLowerCase();
 
-    const { status, progress, result: taskResult, error } = result.data;
-
-    if (status === 'completed') {
-      const image = extractImagePayload({ data: { result: taskResult } });
+    if (COMPLETED_TASK_STATUSES.has(normalizedStatus)) {
+      const image = extractTaskImage(payload);
       if (image.imageUrl || image.base64) {
         return image;
       }
       throw new Error('任务已完成，但未找到图片结果');
     }
 
-    if (status === 'failed') {
-      throw new Error(error?.message || '任务失败');
+    if (FAILED_TASK_STATUSES.has(normalizedStatus)) {
+      throw new Error(payload.error?.message || `任务失败（status=${payload.status}）`);
+    }
+
+    // 少数站点不返回 status，直接把结果放在轮询响应里
+    if (!normalizedStatus) {
+      const image = extractTaskImage(payload);
+      if (image.imageUrl || image.base64) {
+        return image;
+      }
     }
 
     const delay = pollDelayForAttempt(pollCount - 1);
-    process.stderr.write(`生成中... ${progress || 0}%（第 ${pollCount} 次回收，${Math.round(delay / 1000)}s 后继续）\n`);
+    process.stderr.write(`生成中... ${payload.progress || 0}%（status=${normalizedStatus || '未提供'}，第 ${pollCount} 次回收，${Math.round(delay / 1000)}s 后继续）\n`);
     await sleepFn(delay);
   }
 }
@@ -212,6 +278,32 @@ function inferExtension(contentType, source) {
   if (contentType?.includes('webp') || source?.startsWith('data:image/webp')) return '.webp';
   if (contentType?.includes('jpeg') || contentType?.includes('jpg') || source?.startsWith('data:image/jpeg')) return '.jpg';
   return '.png';
+}
+
+/** 只在响应头明确给出图片类型时返回扩展名，无法判断时返回 null。 */
+function inferExtensionFromContentType(contentType) {
+  const type = String(contentType || '').toLowerCase();
+  if (type.includes('png')) return '.png';
+  if (type.includes('webp')) return '.webp';
+  if (type.includes('jpeg') || type.includes('jpg')) return '.jpg';
+  if (type.includes('gif')) return '.gif';
+  return null;
+}
+
+/** 从下载地址的 pathname 猜扩展名，忽略 query string，猜不出返回 null。 */
+function inferExtensionFromUrl(url) {
+  try {
+    const pathname = new URL(url).pathname.toLowerCase();
+    for (const extension of ['.png', '.jpg', '.jpeg', '.webp', '.gif']) {
+      if (pathname.endsWith(extension)) {
+        return extension === '.jpeg' ? '.jpg' : extension;
+      }
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
 }
 
 function looksLikeRemoteImageReference(value) {
@@ -272,20 +364,81 @@ function buildOutputPath(output, extension, runDir) {
   return path.join(runDir, `oh-coage-${Date.now()}${extension}`);
 }
 
-async function downloadToFile(url, filePath) {
+function downloadToFile(url, filePath, redirectsLeft = MAX_REDIRECTS) {
   return new Promise((resolve, reject) => {
-    const mod = url.startsWith('https') ? https : http;
-    const req = mod.get(url, (res) => {
-      if (res.statusCode >= 400) {
-        reject(new Error(`下载失败，HTTP ${res.statusCode}`));
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      reject(new Error(`下载地址不合法: ${truncateForLog(url)}`));
+      return;
+    }
+
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      reject(new Error(`不支持的下载协议: ${parsed.protocol}//`));
+      return;
+    }
+
+    const mod = parsed.protocol === 'https:' ? https : http;
+    const req = mod.get(url, {
+      headers: {
+        'User-Agent': 'oh-coage/0.1 (+https://github.com/Four-JJJJ/oh-coage)',
+        'Accept': 'image/*,*/*;q=0.8',
+      },
+    }, (res) => {
+      const statusCode = res.statusCode || 0;
+
+      if (REDIRECT_STATUS_CODES.has(statusCode)) {
+        const location = res.headers.location;
+        res.resume();
+
+        if (!location) {
+          reject(new Error(`下载失败，HTTP ${statusCode} 但响应缺少 Location`));
+          return;
+        }
+        if (redirectsLeft <= 0) {
+          reject(new Error(`下载失败，重定向次数超过 ${MAX_REDIRECTS} 次`));
+          return;
+        }
+
+        let nextUrl;
+        try {
+          nextUrl = new URL(location, url).toString();
+        } catch {
+          reject(new Error(`下载失败，重定向地址不合法: ${truncateForLog(location)}`));
+          return;
+        }
+
+        downloadToFile(nextUrl, filePath, redirectsLeft - 1).then(resolve, reject);
+        return;
+      }
+
+      if (statusCode >= 400) {
+        res.resume();
+        reject(new Error(`下载失败，HTTP ${statusCode}`));
         return;
       }
 
       const target = fs.createWriteStream(filePath);
+      let settled = false;
+      const fail = (error) => {
+        if (settled) return;
+        settled = true;
+        target.destroy();
+        // 清理写了一半的残文件，避免留下看起来正常的空图
+        fs.rm(filePath, { force: true }, () => reject(error));
+      };
+
+      res.on('error', fail);
+      target.on('error', fail);
       res.pipe(target);
-      target.on('finish', () => target.close(() => resolve(filePath)));
-      target.on('error', reject);
+      target.on('finish', () => {
+        if (settled) return;
+        settled = true;
+        target.close(() => resolve(String(res.headers['content-type'] || '')));
+      });
     });
+
     req.setTimeout(REQUEST_TIMEOUT_MS, () => {
       req.destroy(new Error(`Request timed out after ${REQUEST_TIMEOUT_MS}ms`));
     });
@@ -310,7 +463,7 @@ async function saveImage(image, output, runDir) {
 
   if (image.base64) {
     const dataUri = image.base64.startsWith('data:') ? image.base64 : `data:image/png;base64,${image.base64}`;
-    const [, meta, encoded] = dataUri.match(/^data:([^;]+);base64,(.+)$/) || [];
+    const [, meta, encoded] = dataUri.match(/^data:([^;]+);base64,([\s\S]+)$/) || [];
     if (!encoded) {
       throw new Error('base64 图片格式不合法');
     }
@@ -321,8 +474,20 @@ async function saveImage(image, output, runDir) {
   }
 
   if (image.imageUrl) {
-    const filePath = buildOutputPath(output, inferExtension('', image.imageUrl), runDir);
-    await downloadToFile(image.imageUrl, filePath);
+    // 先按 URL 猜扩展名落到磁盘，下载后再按响应头纠正
+    const guessedExtension = inferExtensionFromUrl(image.imageUrl) || '.png';
+    const filePath = buildOutputPath(output, guessedExtension, runDir);
+    const contentType = await downloadToFile(image.imageUrl, filePath);
+
+    if (!output) {
+      const actualExtension = inferExtensionFromContentType(contentType);
+      if (actualExtension && actualExtension !== guessedExtension) {
+        const renamedPath = `${filePath.slice(0, -guessedExtension.length)}${actualExtension}`;
+        fs.renameSync(filePath, renamedPath);
+        return renamedPath;
+      }
+    }
+
     return filePath;
   }
 
@@ -336,6 +501,15 @@ function parseArgs() {
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
       case '--prompt': parsed.prompt = args[++i]; break;
+      case '--model': {
+        const modelValue = args[++i];
+        if (!modelValue || modelValue.startsWith('--')) {
+          console.error('--model 需要一个模型短名或 model ID，例如：--model image-2.5-flare');
+          process.exit(1);
+        }
+        parsed.model = modelValue;
+        break;
+      }
       case '--size': parsed.size = args[++i]; break;
       case '--resolution': parsed.resolution = args[++i]; break;
       case '--image-url': parsed.imageUrls.push(args[++i]); break;
@@ -349,7 +523,7 @@ function parseArgs() {
   }
 
   if (!parsed.prompt) {
-    console.error('用法: node generate.js --prompt "提示词" [--profile NAME] [--size 1:1] [--resolution 2k] [--image-url URL] [--base-url URL] [--api-key KEY] [--output FILE | --out-dir DIR] [--no-fallback]');
+    console.error('用法: node generate.js --prompt "提示词" [--model NAME] [--profile NAME] [--size 1:1] [--resolution 2k] [--image-url URL] [--base-url URL] [--api-key KEY] [--output FILE | --out-dir DIR] [--no-fallback]');
     process.exit(1);
   }
 
@@ -414,14 +588,33 @@ function resolveRuntimeConfig(cli) {
     process.exit(1);
   }
 
+  // base_url 不合法（拼错、用了非 http/https 协议）的 profile 直接跳过，不拖垮整轮 fallback
+  const usableCandidates = [];
+  for (const candidate of candidates) {
+    try {
+      assertValidBaseUrl(candidate.baseUrl);
+      usableCandidates.push(candidate);
+    } catch (error) {
+      process.stderr.write(`跳过 profile=${candidate.name}：${error.message}\n`);
+    }
+  }
+
+  if (!usableCandidates.length) {
+    throw new Error('没有 base_url 合法的 profile 可尝试，请运行 setup.js --health-check 检查配置。');
+  }
+
+  // 模型解析：--model 优先，其次配置里的 current_model，最后默认
+  const model = cli.model
+    ? resolveModel(cli.model, config?.custom_models)
+    : resolveConfiguredModel(config);
+
   return {
-    candidates,
-    activeProfileName,
-    autoFallback: cli.autoFallback,
+    candidates: usableCandidates,
+    model,
   };
 }
 
-function buildLogRecordBase(cli, startedAt) {
+function buildLogRecordBase(cli, startedAt, model) {
   return {
     started_at: startedAt.toISOString(),
     prompt: cli.prompt,
@@ -430,6 +623,9 @@ function buildLogRecordBase(cli, startedAt) {
     image_url_count: cli.imageUrls.length,
     size: cli.size,
     resolution: cli.resolution,
+    model: model.model,
+    model_key: model.key,
+    model_source: model.source,
     explicit_profile: cli.profile || null,
     auto_fallback: cli.autoFallback,
   };
@@ -439,17 +635,35 @@ function writeRunLog(record) {
   appendJsonl(RUNS_PATH, record);
 }
 
-async function runCandidate(candidate, cli, finalResolution, runRecord) {
+const RETRY_DELAY_MS = { rate_limit: 1500, network: 1000, upstream: 1000 };
+
+async function runCandidate(candidate, cli, finalResolution, runRecord, model) {
   const attemptStartedAt = new Date();
   const attempt = {
     profile: candidate.name,
     base_url: candidate.baseUrl,
     started_at: attemptStartedAt.toISOString(),
   };
-  const candidateApiKey = candidate.apiKey || readKeychainSecret(candidate.keychainAccount);
+
+  let candidateApiKey;
+  try {
+    candidateApiKey = candidate.apiKey || readKeychainSecret(candidate.keychainAccount);
+  } catch (error) {
+    // Keychain 读不到 key 只说明这一个 profile 不可用，应该交给上层 fallback，而不是整轮退出
+    attempt.status = 'failed';
+    attempt.last_error = truncateForLog(error.message, MAX_LOG_ERROR_LENGTH);
+    attempt.error_kind = 'keychain';
+    attempt.completed_at = new Date().toISOString();
+    attempt.duration_ms = Date.now() - attemptStartedAt.getTime();
+    runRecord.attempts.push({ ...attempt });
+    throw markFallback(error, 'keychain');
+  }
 
   const mode = cli.imageUrls.length > 0 ? '图生图' : '文生图';
-  process.stderr.write(`正在提交${mode}任务: profile=${candidate.name}, base_url=${candidate.baseUrl}, prompt=${cli.prompt}, size=${cli.size}, resolution=${finalResolution}\n`);
+  process.stderr.write(`正在提交${mode}任务: profile=${candidate.name}, base_url=${candidate.baseUrl}, model=${model.model}, prompt=${cli.prompt}, size=${cli.size}, resolution=${finalResolution}\n`);
+  if (model.source === 'default' && !cli.model) {
+    process.stderr.write(`提示：当前使用默认模型 ${model.model}，可用 setup.js --model 切换。\n`);
+  }
   if (cli.imageUrls.length > 0) {
     process.stderr.write(`参考图片: ${cli.imageUrls.length} 张\n`);
   }
@@ -458,14 +672,16 @@ async function runCandidate(candidate, cli, finalResolution, runRecord) {
   for (let index = 1; index <= MAX_RETRY_ATTEMPTS; index++) {
     attempt.try_count = index;
     try {
-      const submitted = await submitGeneration(candidateApiKey, candidate.baseUrl, cli.prompt, cli.size, finalResolution, cli.imageUrls);
+      const submitted = await submitGeneration(candidateApiKey, candidate.baseUrl, cli.prompt, cli.size, finalResolution, cli.imageUrls, model.model);
       attempt.response_mode = submitted.mode;
 
       const image = submitted.mode === 'async'
         ? await (attempt.task_id = submitted.taskId, process.stderr.write(`任务已提交: ${submitted.taskId}\n`), pollTask(candidateApiKey, candidate.baseUrl, submitted.taskId))
         : (process.stderr.write('接口直接返回了图片结果\n'), submitted.image);
 
-      const runDir = candidate.outputOverride ? null : buildRunDir(candidate.rootOutputDir, attemptStartedAt);
+      const runDir = candidate.outputOverride
+        ? null
+        : buildRunDir(candidate.rootOutputDir || process.cwd(), attemptStartedAt);
       const savedPath = await saveImage(image, candidate.outputOverride, runDir);
 
       attempt.status = 'success';
@@ -478,6 +694,8 @@ async function runCandidate(candidate, cli, finalResolution, runRecord) {
         prompt: cli.prompt,
         profile: candidate.name,
         base_url: candidate.baseUrl,
+        model: model.model,
+        model_key: model.key,
         size: cli.size,
         resolution: finalResolution,
         started_at: attemptStartedAt.toISOString(),
@@ -493,22 +711,17 @@ async function runCandidate(candidate, cli, finalResolution, runRecord) {
       lastError = error;
       const classification = classifyError(error);
       attempt.status = 'failed';
-      attempt.last_error = error.message;
+      attempt.last_error = truncateForLog(error.message, MAX_LOG_ERROR_LENGTH);
       attempt.error_kind = classification.kind;
       attempt.status_code = classification.statusCode;
       attempt.completed_at = new Date().toISOString();
       attempt.duration_ms = Date.now() - attemptStartedAt.getTime();
 
-      if (classification.kind === 'rate_limit' && index < MAX_RETRY_ATTEMPTS) {
-        const delay = 1500 * index;
-        process.stderr.write(`遇到限流，${delay}ms 后重试当前 profile...\n`);
-        await sleep(delay);
-        continue;
-      }
-
-      if (classification.retryable && index < MAX_RETRY_ATTEMPTS && classification.kind === 'network') {
-        const delay = 1000 * index;
-        process.stderr.write(`遇到网络错误，${delay}ms 后重试当前 profile...\n`);
+      // retryable 覆盖限流、网络抖动和 5xx 上游故障，统一在同 profile 上退避重试一次
+      if (classification.retryable && index < MAX_RETRY_ATTEMPTS) {
+        const delay = (RETRY_DELAY_MS[classification.kind] || 1000) * index;
+        const status = classification.statusCode ? ` ${classification.statusCode}` : '';
+        process.stderr.write(`遇到 ${classification.kind}${status}，${delay}ms 后重试当前 profile...\n`);
         await sleep(delay);
         continue;
       }
@@ -527,7 +740,7 @@ async function main() {
   const runtime = resolveRuntimeConfig(cli);
   const startedAt = new Date();
   const runRecord = {
-    ...buildLogRecordBase(cli, startedAt),
+    ...buildLogRecordBase(cli, startedAt, runtime.model),
     attempts: [],
   };
 
@@ -541,7 +754,7 @@ async function main() {
     const candidate = runtime.candidates[index];
 
     try {
-      const result = await runCandidate(candidate, cli, finalResolution, runRecord);
+      const result = await runCandidate(candidate, cli, finalResolution, runRecord, runtime.model);
       const completedAt = new Date();
       runRecord.status = 'success';
       runRecord.completed_at = completedAt.toISOString();
@@ -580,7 +793,7 @@ async function main() {
       runRecord.status = 'failed';
       runRecord.completed_at = failedAt.toISOString();
       runRecord.duration_ms = failedAt.getTime() - startedAt.getTime();
-      runRecord.final_error = error.message;
+      runRecord.final_error = truncateForLog(error.message, MAX_LOG_ERROR_LENGTH);
       runRecord.final_error_kind = classification.kind;
       runRecord.final_status_code = classification.statusCode;
       writeRunLog(runRecord);
@@ -594,8 +807,15 @@ async function main() {
 if (process.env.OH_COAGE_TEST === '1') {
   module.exports = {
     POLL_DELAYS_MS,
+    MAX_POLL_FAILURES,
     pollDelayForAttempt,
     pollTask,
+    classifyError,
+    truncateForLog,
+    inferExtensionFromUrl,
+    inferExtensionFromContentType,
+    downloadToFile,
+    saveImage,
   };
 } else {
   main().catch((error) => {

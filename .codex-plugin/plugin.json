@@ -1,7 +1,7 @@
 {
   "name": "oh-coage",
-  "version": "0.1.0+codex.20260825024640",
-  "description": "\u901a\u8fc7\u53ef\u914d\u7f6e\u7684 GPT-Image-2 API \u5728 Codex \u4e2d\u751f\u6210\u548c\u7f16\u8f91\u56fe\u7247\u3002",
+  "version": "0.2.0+codex.20261001225333",
+  "description": "通过可配置站点的 GPT-Image 系列 API 在 Codex 中生成和编辑图片，支持模型选择。",
   "author": {
     "name": "Four-JJJJ",
     "url": "https://github.com/Four-JJJJ"
@@ -10,26 +10,30 @@
   "keywords": [
     "image-generation",
     "gpt-image-2",
+    "gpt-image-2.5",
+    "model-selection",
     "image-editing",
     "keychain"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "oh-coage",
-    "shortDescription": "\u5728 Codex \u4e2d\u751f\u6210\u548c\u7f16\u8f91\u56fe\u7247\u3002",
-    "longDescription": "\u4f7f\u7528\u53ef\u914d\u7f6e\u7ad9\u70b9\u7684 GPT-Image-2 API\uff0c\u652f\u6301\u6587\u751f\u56fe\u3001\u56fe\u751f\u56fe\u3001\u5f02\u6b65\u4efb\u52a1\u8f6e\u8be2\u3001\u591a profile fallback\uff0c\u4ee5\u53ca macOS Keychain \u5bc6\u94a5\u5b58\u50a8\u3002",
+    "shortDescription": "在 Codex 中生成和编辑图片，可切换模型。",
+    "longDescription": "使用可配置站点的 GPT-Image 系列 API，支持文生图、图生图、异步任务轮询、多 profile fallback；可在 gpt-image-2 / gpt-image-2.5-sunburst / gpt-image-2.5-flare 三个内置模型间持久切换，也可添加自定义模型；API Key 存入 macOS Keychain，本地配置只保存非敏感信息。",
     "developerName": "Four-JJJJ",
     "category": "Productivity",
     "capabilities": [
       "Image generation",
       "Image editing",
+      "Model selection",
       "Local file output",
       "Interactive setup"
     ],
     "defaultPrompt": [
-      "\u5e2e\u6211\u751f\u6210\u4e00\u5f20\u56fe\u7247",
-      "\u53c2\u8003\u8fd9\u5f20\u56fe\u91cd\u65b0\u521b\u4f5c",
-      "\u68c0\u67e5 oh-coage \u5f53\u524d\u914d\u7f6e"
+      "帮我生成一张图片",
+      "参考这张图重新创作",
+      "用 2.5 的模型画一张图",
+      "检查 oh-coage 当前配置"
     ],
     "brandColor": "#2563EB"
   }

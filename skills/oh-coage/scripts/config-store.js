@@ -11,17 +11,38 @@ const DEFAULT_BASE_URL = 'https://your-image-site.example/v1';
 const DEFAULT_CONFIG_FILENAME = 'oh-coage-config.json';
 const KEYCHAIN_SERVICE = 'oh-coage';
 
+const commandExistsCache = new Map();
+
 function commandExists(command) {
-  const result = spawnSync('bash', ['-lc', `command -v ${command}`], { encoding: 'utf-8' });
-  return result.status === 0;
+  if (!commandExistsCache.has(command)) {
+    const result = spawnSync('bash', ['-lc', `command -v ${command}`], { encoding: 'utf-8' });
+    commandExistsCache.set(command, result.status === 0);
+  }
+
+  return commandExistsCache.get(command);
 }
 
-function ensureDir(dirPath) {
-  fs.mkdirSync(dirPath, { recursive: true });
+function ensureDir(dirPath, mode) {
+  fs.mkdirSync(dirPath, mode ? { recursive: true, mode } : { recursive: true });
 }
 
 function normalizeBaseUrl(baseUrl) {
   return (baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
+}
+
+function assertValidBaseUrl(baseUrl) {
+  let parsed;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    throw new Error(`base_url 不是合法 URL: ${baseUrl}`);
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`base_url 仅支持 http/https，当前为 ${parsed.protocol}//`);
+  }
+
+  return parsed;
 }
 
 function readJson(filePath, fallback = null) {
@@ -32,17 +53,32 @@ function readJson(filePath, fallback = null) {
   try {
     return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
   } catch (error) {
-    throw new Error(`无法解析 JSON 配置文件：${error.message}`);
+    throw new Error(`无法解析 JSON 配置文件 ${filePath}：${error.message}`);
   }
 }
 
+/** APP_DIR 里存的是运行日志（含 prompt），收紧到 0700；其他目录保持默认权限。 */
+function ensureParentDir(filePath) {
+  const dir = path.dirname(filePath);
+  ensureDir(dir, dir === APP_DIR ? 0o700 : undefined);
+}
+
 function writeJson(filePath, value) {
-  ensureDir(path.dirname(filePath));
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+  ensureParentDir(filePath);
+
+  // 原子写：先落临时文件再 rename，避免写到一半崩溃留下半个 JSON 把配置整个弄坏
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`);
+    fs.renameSync(tempPath, filePath);
+  } catch (error) {
+    fs.rmSync(tempPath, { force: true });
+    throw error;
+  }
 }
 
 function appendJsonl(filePath, value) {
-  ensureDir(path.dirname(filePath));
+  ensureParentDir(filePath);
   fs.appendFileSync(filePath, `${JSON.stringify(value)}\n`);
 }
 
@@ -100,7 +136,20 @@ function loadActiveConfig() {
 }
 
 function saveConfig(configPath, config) {
-  writeJson(configPath, config);
+  // resolved_root_output_dir 是按配置文件所在位置算出来的派生值，绝不能落盘：
+  // 配置文件一旦被搬动（典型场景是放进 iCloud 同步到另一台机器），
+  // 过期的绝对路径会盖掉本应重新解析的相对 root_output_dir
+  const persisted = {
+    ...config,
+    profiles: Object.fromEntries(
+      Object.entries(config.profiles || {}).map(([name, profile]) => {
+        const { resolved_root_output_dir, ...rest } = profile || {};
+        return [name, rest];
+      }),
+    ),
+  };
+
+  writeJson(configPath, persisted);
 }
 
 function buildKeychainAccount(profileName, configPath) {
@@ -140,12 +189,26 @@ function saveKeychainSecret(account, secret) {
     throw new Error('缺少 macOS Keychain 依赖：未找到 security 命令。请先征求用户同意，再补齐该依赖，因为此 skill 需要用 Keychain 安全存储 API Key。');
   }
 
-  const result = spawnSync('security', ['add-generic-password', '-U', '-a', account, '-s', KEYCHAIN_SERVICE, '-w', secret], {
+  // 首选交互式写入：security 自己都标注 -w <password> 不安全，因为明文密码会出现在进程 argv 里，
+  // 同机其他进程在那一瞬间可以读到。把 -w 放在末位可以让它从 stdin 读密码（会问两次：输入 + 确认）。
+  const prompted = spawnSync(
+    'security',
+    ['add-generic-password', '-U', '-a', account, '-s', KEYCHAIN_SERVICE, '-w'],
+    { encoding: 'utf-8', input: `${secret}\n${secret}\n` },
+  );
+
+  if (prompted.status === 0) {
+    return;
+  }
+
+  // 少数环境（没有可用 stdin / tty）下提示式写入会失败，退回 argv 方式，保证初始化不被打断
+  const fallback = spawnSync('security', ['add-generic-password', '-U', '-a', account, '-s', KEYCHAIN_SERVICE, '-w', secret], {
     encoding: 'utf-8',
   });
 
-  if (result.status !== 0) {
-    throw new Error(formatKeychainError('write', result.stderr) || '写入 Keychain 失败');
+  if (fallback.status !== 0) {
+    const stderr = fallback.stderr || prompted.stderr;
+    throw new Error(formatKeychainError('write', stderr) || '写入 Keychain 失败');
   }
 }
 
@@ -206,6 +269,7 @@ module.exports = {
   KEYCHAIN_SERVICE,
   ensureDir,
   normalizeBaseUrl,
+  assertValidBaseUrl,
   readJson,
   writeJson,
   appendJsonl,
