@@ -120,3 +120,35 @@ test('the app directory is created with private permissions', async (t) => {
   const mode = fs.statSync(path.join(home, '.oh-coage')).mode & 0o777;
   assert.equal(mode, 0o700, `运行日志目录应只有属主可访问，实际 ${mode.toString(8)}`);
 });
+
+test('--health-check does not create the output directory as a side effect', async (t) => {
+  const home = createTempDir();
+  const configDir = createTempDir();
+  const outputDir = path.join(configDir, 'not-yet-created');
+  t.after(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  });
+
+  const configPath = path.join(configDir, 'oh-coage-config.json');
+  fs.writeFileSync(configPath, JSON.stringify({
+    version: 1,
+    active_profile: 'main',
+    current_model: 'image-2',
+    profiles: {
+      main: {
+        base_url: 'https://img.example/v1',
+        root_output_dir: outputDir,
+        keychain_account: 'main:x',
+      },
+    },
+  }, null, 2));
+  fs.mkdirSync(path.join(home, '.oh-coage'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.oh-coage', 'state.json'), JSON.stringify({ config_path: configPath }));
+
+  const result = await runSetup(['--health-check'], home);
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /尚不存在，首次生成时自动创建/);
+  assert.equal(fs.existsSync(outputDir), false, 'health-check 不应创建输出目录');
+});

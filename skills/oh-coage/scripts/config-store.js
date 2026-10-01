@@ -202,6 +202,7 @@ function saveKeychainSecret(account, secret) {
   }
 
   // 少数环境（没有可用 stdin / tty）下提示式写入会失败，退回 argv 方式，保证初始化不被打断
+  process.stderr.write('提示：当前环境无法通过 stdin 写入密钥，已退回命令行参数方式，该值会短暂出现在进程列表里。\n');
   const fallback = spawnSync('security', ['add-generic-password', '-U', '-a', account, '-s', KEYCHAIN_SERVICE, '-w', secret], {
     encoding: 'utf-8',
   });

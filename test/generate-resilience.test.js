@@ -332,3 +332,27 @@ test('generate gives a clear error for a flag missing its value instead of a Typ
   assert.match(result.stderr, /--image-url 缺少参数值/);
   assert.doesNotMatch(result.stderr, /TypeError/);
 });
+
+test('generate warns that --api-key is visible in the process list', async (t) => {
+  const home = createTempDir();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const result = await runGenerate([
+    '--prompt', 'a red apple',
+    '--api-key', 'k',
+    '--base-url', 'http://127.0.0.1:1/v1',
+  ], home);
+
+  assert.match(result.stderr, /--api-key 的密钥会短暂出现在进程列表/);
+  assert.match(result.stderr, /IMAGES2_GEN_API_KEY/);
+});
+
+test('isPrivateOrReservedHost flags loopback/private/metadata hosts', () => {
+  for (const host of ['127.0.0.1', '127.8.8.8', '169.254.169.254', '10.0.0.5', '172.16.1.1', '172.31.255.255', '192.168.1.1', '0.0.0.0', 'localhost', '::1', 'fe80::1', 'fc00::1']) {
+    assert.equal(generate.isPrivateOrReservedHost(host), true, `${host} 应被识别为本地/保留地址`);
+  }
+
+  for (const host of ['example.com', '8.8.8.8', '1.1.1.1', '172.32.0.1', '11.0.0.1', '']) {
+    assert.equal(generate.isPrivateOrReservedHost(host), false, `${host} 不应被误判为本地地址`);
+  }
+});

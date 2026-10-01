@@ -366,6 +366,37 @@ function buildOutputPath(output, extension, runDir) {
   return path.join(runDir, `oh-coage-${Date.now()}${extension}`);
 }
 
+/** 判断主机名是否指向本地/内网/保留地址。用于下载前给出 SSRF 提示。 */
+function isPrivateOrReservedHost(hostname) {
+  if (!hostname) return false;
+
+  const host = hostname.toLowerCase();
+  if (host === 'localhost' || host === 'localhost.localdomain') return true;
+
+  const ip = host.replace(/^\[|\]$/g, ''); // 去掉 IPv6 的方括号
+
+  // IPv4 字面量
+  const ipv4 = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const [a, b, c, d] = ipv4.slice(1).map(Number);
+    if ([a, b, c, d].some((n) => n > 255)) return false;
+    if (a === 10) return true;                               // 10.0.0.0/8
+    if (a === 172 && b >= 16 && b <= 31) return true;        // 172.16.0.0/12
+    if (a === 192 && b === 168) return true;                 // 192.168.0.0/16
+    if (a === 169 && b === 254) return true;                 // 169.254.0.0/16（链路本地 + 云元数据）
+    if (a === 127) return true;                              // 127.0.0.0/8
+    if (a === 0) return true;                                // 0.0.0.0/8
+    return false;
+  }
+
+  // IPv6 字面量
+  if (ip === '::' || ip === '::1') return true;              // 未指定 / 回环
+  if (ip.startsWith('fe80:')) return true;                   // 链路本地
+  if (ip.startsWith('fc') || ip.startsWith('fd')) return true; // fc00::/7 唯一本地
+
+  return false;
+}
+
 function downloadToFile(url, filePath, redirectsLeft = MAX_REDIRECTS) {
   return new Promise((resolve, reject) => {
     let parsed;
@@ -379,6 +410,11 @@ function downloadToFile(url, filePath, redirectsLeft = MAX_REDIRECTS) {
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       reject(new Error(`不支持的下载协议: ${parsed.protocol}//`));
       return;
+    }
+
+    // SSRF 提示：下载地址若指向本地/内网/云元数据地址，脚本会直接访问，提醒用户确认可信。
+    if (isPrivateOrReservedHost(parsed.hostname)) {
+      process.stderr.write(`警告：图片下载地址指向本地/内网/保留地址 (${parsed.hostname})，脚本会直接访问该地址，请确认其可信。\n`);
     }
 
     const mod = parsed.protocol === 'https:' ? https : http;
@@ -764,6 +800,9 @@ async function runCandidate(candidate, cli, finalResolution, runRecord) {
 
 async function main() {
   const cli = parseArgs();
+  if (cli.apiKey) {
+    process.stderr.write('提示：--api-key 的密钥会短暂出现在进程列表（ps 可见）。介意请改用 IMAGES2_GEN_API_KEY 环境变量。\n');
+  }
   cli.imageUrls = normalizeImageReferences(cli.imageUrls);
   const runtime = resolveRuntimeConfig(cli);
   const startedAt = new Date();
@@ -848,6 +887,7 @@ if (process.env.OH_COAGE_TEST === '1') {
     truncateForLog,
     inferExtensionFromUrl,
     inferExtensionFromContentType,
+    isPrivateOrReservedHost,
     downloadToFile,
     saveImage,
   };

@@ -179,10 +179,11 @@ async function healthCheck(options) {
       const rootOutputDir = profile.resolved_root_output_dir || profile.root_output_dir || profile.output_dir;
       if (!rootOutputDir) {
         checks.push({ item: 'root_output_dir', ok: false, detail: 'profile 未配置输出目录' });
-      } else {
-        ensureDir(rootOutputDir);
+      } else if (fs.existsSync(rootOutputDir)) {
         fs.accessSync(rootOutputDir, fs.constants.W_OK);
         checks.push({ item: 'root_output_dir', ok: true, detail: `${profile.root_output_dir || profile.output_dir} -> ${rootOutputDir}` });
+      } else {
+        checks.push({ item: 'root_output_dir', ok: true, detail: `${profile.root_output_dir || profile.output_dir} -> ${rootOutputDir}（尚不存在，首次生成时自动创建）` });
       }
     } catch (error) {
       checks.push({ item: 'root_output_dir', ok: false, detail: error.message });
