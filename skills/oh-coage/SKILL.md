@@ -69,6 +69,19 @@ node "$SKILL_DIR/scripts/setup.js" --model "image-2.5-flare"
 node "$SKILL_DIR/scripts/generate.js" --model "image-2.5-sunburst" --prompt "用户的提示词"
 ```
 
+### 模型优先级
+
+某个候选 profile 实际用哪个模型，顺序是：
+
+1. `generate.js --model`（本次显式指定）
+2. 该 profile 的 `model` 字段（`setup.js --profile-model` 固定）
+3. 配置里的 `current_model`（`setup.js --model` 切换的全局值）
+4. 默认 `image-2`
+
+也就是说 fallback 链上**每个 profile 各用各的**：固定了就用固定的，没固定才跟随全局。`--list` 能看到哪些 profile 固定了模型。
+
+如果某个 profile 固定了一个已不存在的模型，生成时它会被跳过并打印提示，不会中断整轮。
+
 ### 用户要自定义模型时
 
 必须**先向用户问清该站点要求的准确 model ID 字符串**，再执行：
@@ -79,7 +92,17 @@ node "$SKILL_DIR/scripts/setup.js" --add-model "my-model" --model-id "vendor-mod
 
 不要自己编一个 model ID，也不要用看起来像的字符串凑数。缺少 `--model-id` 时脚本会拒绝执行并给出提示。删除自定义模型用 `--delete-model`；内置模型不可删除。
 
-模型是全局设置，不区分 profile。如果 fallback 到某个不支持当前模型的站点，接口会报错，此时用 `--model` 指定该站点支持的模型。
+### 给某个站点固定模型
+
+当用户说「这个站点只能用某个模型」时，用它而不是全局切换：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --profile-model "image-2.5-flare" --profile "main"
+```
+
+初始化时也可以带 `--profile-model` 一起固定。取消固定传 `none`。
+
+注意：`setup.js --model` 和初始化参数可以同时给（会先初始化、再切换全局模型），但 `--model` 是**全局**开关，不要用它来表达「只给这个站点固定」。
 
 ## 强制流程
 
@@ -166,10 +189,10 @@ node "$SKILL_DIR/scripts/setup.js" --add-model "my-model" --model-id "vendor-mod
 
 表单提交后会发来一条包含 `OH_COAGE_INIT_FORM_SUBMISSION` 标记的结构化消息。收到这条消息后：
 
-1. 直接解析其中的 `outputDir`、`profile`、`baseUrl`、`apiKey`
-2. 用 `$SKILL_DIR/scripts/setup.js` 完成本地初始化，并加上 `--activate`
+1. 直接解析其中的 `outputDir`、`profile`、`baseUrl`、`apiKey`、`model`
+2. 用 `$SKILL_DIR/scripts/setup.js` 完成本地初始化，加上 `--activate`，并把 `model` 通过 `--model` 一起传入（`setup.js` 支持初始化和 `--model` 同时给，会先初始化再切换全局模型）
 3. 不要在命令输出、日志、回复或截图中复述 `apiKey`
-4. 初始化后运行一次 `--health-check`，再报告 profile、保存目录和检查结果
+4. 初始化后运行一次 `--health-check`，再报告 profile、模型、保存目录和检查结果
 
 保存目录字段默认已经预填。用户可以直接使用当前项目目录或桌面，也可以手动修改该字段；不要在首次初始化时额外打开系统文件夹选择器。
 
@@ -284,7 +307,7 @@ node "$SKILL_DIR/scripts/generate.js" \
 脚本会自动：
 
 - 读取当前 active profile
-- 使用配置文件里的当前模型（`--model` 可单次覆盖）
+- 按上面的模型优先级决定用哪个模型（`--model` 可单次覆盖）
 - 从 Keychain 读取该 profile 的 API Key
 - 调用对应 `base_url`
 - 将图片默认保存到该 profile 的总目录下，并自动创建时间命名子文件夹

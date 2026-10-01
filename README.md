@@ -159,7 +159,7 @@ ln -s "/path/to/oh-coage/skills/oh-coage" ~/.claude/skills/oh-coage
 
 第一次使用时，不要直接调用生成脚本，先初始化。
 
-在支持 inline HTML 渲染的 Codex 类环境里，初始化会优先展示一个可交互表单，填写 profile、站点 URL 和 API Key 后提交。图片保存目录会自动使用当前项目根目录；没有项目上下文时默认使用桌面，也可以手动修改路径。
+在支持 inline HTML 渲染的 Codex 类环境里，初始化会优先展示一个可交互表单，填写 profile、站点 URL、API Key 和默认模型后提交。图片保存目录会自动使用当前项目根目录；没有项目上下文时默认使用桌面，也可以手动修改路径。
 
 其他环境（普通 CLI agent、终端类宿主）不具备表单能力，会直接回退到聊天输入这一基线路径。判定方式是**先看能力再选路径**，不是先试表单再回退。
 
@@ -353,6 +353,9 @@ node "$SKILL_DIR/scripts/setup.js" [options]
   - 可选，配合 `--add-model` 给自定义模型加一句说明
 - `--delete-model`
   - 删除一个自定义模型（内置模型不可删）
+- `--profile-model`
+  - 给某个 profile 固定模型；不写 `--profile` 则作用于当前 active profile
+  - 传 `none` 取消固定，改为跟随全局当前模型
 
 ## 多 profile 管理
 
@@ -536,9 +539,44 @@ node "$SKILL_DIR/scripts/setup.js" --delete-model "my-model"
 - 删掉的正是当前模型时，会自动回到 `image-2`
 - 添加时不给 `--model-id` 会被拦下，并提示你向用户确认 model ID
 
-### 模型是全局设置
+### 给某个站点固定模型
 
-模型不分 profile。如果多个站点支持的模型不同，fallback 到不支持该模型的站点时接口会报错——这种情况下用 `--model` 指定该站点支持的模型，或把不支持的 profile 设成 `"enabled": false`。
+不同站点支持的模型可能不同。可以把某个 profile 固定到它支持的模型：
+
+```bash
+# 固定 main 这个 profile
+node "$SKILL_DIR/scripts/setup.js" --profile-model "image-2.5-flare" --profile "main"
+
+# 不写 --profile 则作用于当前 active profile
+node "$SKILL_DIR/scripts/setup.js" --profile-model "image-2.5-flare"
+
+# 取消固定，让它跟随全局当前模型
+node "$SKILL_DIR/scripts/setup.js" --profile-model none --profile "main"
+```
+
+初始化时也可以顺手固定：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" \
+  --output-dir "/path/to/images" \
+  --profile "main" \
+  --base-url "https://example.com/v1" \
+  --api-key "KEY" \
+  --profile-model "image-2.5-sunburst"
+```
+
+### 模型优先级
+
+一个候选 profile 实际用哪个模型，按这个顺序决定：
+
+1. `generate.js --model`（本次显式指定，压过一切）
+2. 该 profile 的 `model` 字段（`--profile-model` 固定）
+3. 配置里的 `current_model`（`setup.js --model` 切换的全局值）
+4. 默认 `image-2`
+
+所以在 fallback 链上，**每个 profile 会各自用自己固定的模型**；没固定的才跟随全局。用 `--list-models` 看全局值，用 `--list` 看每个 profile 是否固定了模型。
+
+如果某个 profile 固定了一个已经不存在的模型（比如自定义模型被删了），生成时该 profile 会被跳过并打印提示，而不是中断整轮。
 
 ## 比例和分辨率建议
 
@@ -688,7 +726,8 @@ node "$SKILL_DIR/scripts/generate.js" \
 - 开始时间
 - prompt 摘要
 - 使用的 profile
-- 使用的模型（`model` / `model_key` / `model_source`）
+- 使用的模型（`model` / `model_key` / `model_source`，以及显式指定的 `requested_model`）
+  - `model_source` 取值：`cli`（`--model` 指定）/ `profile`（profile 固定）/ `config`（全局当前）/ `default`
 - 每次尝试的错误码 / 错误类型
 - 最终是否成功
 - 保存路径
@@ -796,6 +835,8 @@ npm test        # 全部测试（node --test）
 
 - 配置文件读写、相对路径解析、派生字段不落盘
 - 模型注册表解析、歧义拒绝、自定义模型增删、当前模型持久切换
+- profile 固定模型、fallback 链上各 profile 各用各的模型
+- 初始化与 `--model` 组合（先初始化再切换）、`security` 以 stub 替代以避开真实钥匙串
 - 图生图本地上传、缺失参考图报错
 - 下载跟随跳转、扩展名按 `content-type` 纠正、失败清理残文件
 - 异步任务轮询节奏、瞬时故障重试、终态识别、结构非法快速失败

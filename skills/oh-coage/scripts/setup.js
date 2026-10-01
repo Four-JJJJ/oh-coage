@@ -30,6 +30,7 @@ const {
   buildModelCatalog,
   resolveModel,
   resolveConfiguredModel,
+  isClearModelInput,
   isBuiltinModelKey,
   normalizeModelInput,
 } = require('./models');
@@ -62,6 +63,15 @@ function parseArgs() {
       case '--delete-model': parsed.deleteModel = args[++i]; break;
       case '--health-check': parsed.healthCheck = true; break;
       case '--live': parsed.live = true; break;
+      case '--profile-model': {
+        const value = args[++i];
+        if (!value || value.startsWith('--')) {
+          console.error('--profile-model 需要一个模型短名，或用 "none" 取消固定');
+          process.exit(1);
+        }
+        parsed.profileModel = value;
+        break;
+      }
     }
   }
 
@@ -71,7 +81,7 @@ function parseArgs() {
 function printUsage() {
   console.error('用法:');
   console.error('  初始化或新增 profile:');
-  console.error('    node setup.js --output-dir "/path/to/images" --profile "main" --base-url "https://example.com/v1" --api-key "KEY" [--activate]');
+  console.error('    node setup.js --output-dir "/path/to/images" --profile "main" --base-url "https://example.com/v1" --api-key "KEY" [--activate] [--model "image-2"]');
   console.error('  列出 profile:');
   console.error('    node setup.js --list');
   console.error('  切换当前 profile:');
@@ -92,6 +102,10 @@ function printUsage() {
   console.error('    node setup.js --add-model "my-model" --model-id "vendor-model-id" [--label "说明"]');
   console.error('  删除自定义模型:');
   console.error('    node setup.js --delete-model "my-model"');
+  console.error('  给某个 profile 固定模型（不写 --profile 则作用于当前 profile）:');
+  console.error('    node setup.js --profile-model "image-2.5-flare" [--profile "main"]');
+  console.error('  取消固定，让它跟随全局当前模型:');
+  console.error('    node setup.js --profile-model none [--profile "main"]');
 }
 
 function requireConfig() {
@@ -113,7 +127,8 @@ function listProfiles() {
   console.log(`current_model: ${resolveConfiguredModel(config).key}`);
   Object.entries(config.profiles || {}).forEach(([name, profile]) => {
     const flag = name === config.active_profile ? '*' : ' ';
-    console.log(`${flag} ${name} -> ${profile.base_url} -> ${profile.root_output_dir || profile.output_dir}`);
+    const modelNote = profile.model ? ` [model: ${profile.model}]` : '';
+    console.log(`${flag} ${name} -> ${profile.base_url} -> ${profile.root_output_dir || profile.output_dir}${modelNote}`);
   });
 }
 
@@ -182,6 +197,19 @@ async function healthCheck(options) {
       checks.push({ item: 'keychain', ok: true, detail: `loaded (${key.length} chars)` });
     } catch (error) {
       checks.push({ item: 'keychain', ok: false, detail: error.message });
+    }
+
+    try {
+      const profileModel = profile.model
+        ? resolveModel(profile.model, config.custom_models)
+        : resolveConfiguredModel(config);
+      checks.push({
+        item: 'model',
+        ok: true,
+        detail: `${profileModel.model}${profile.model ? '（profile 固定）' : '（跟随全局）'}`,
+      });
+    } catch (error) {
+      checks.push({ item: 'model', ok: false, detail: error.message.split('\n')[0] });
     }
 
     const healthy = checks.every((check) => check.ok);
@@ -299,6 +327,41 @@ function deleteCustomModel(modelInput) {
   console.log(`已删除自定义模型: ${key}`);
 }
 
+function setProfileModel(options) {
+  const { config, configPath } = requireConfig();
+  const targetName = options.profile || config.active_profile;
+  const profile = config.profiles?.[targetName];
+
+  if (!profile) {
+    throw new Error(`profile 不存在: ${targetName}`);
+  }
+
+  profile.updated_at = new Date().toISOString();
+  config.updated_at = profile.updated_at;
+
+  if (isClearModelInput(options.profileModel)) {
+    delete profile.model;
+    saveConfig(configPath, config);
+    console.log(`已取消 profile ${targetName} 的固定模型，将跟随全局当前模型。`);
+    return;
+  }
+
+  const resolved = resolveModel(options.profileModel, config.custom_models);
+  profile.model = resolved.key;
+  saveConfig(configPath, config);
+
+  console.log(`已固定 profile ${targetName} 使用模型: ${resolved.key} -> ${resolved.model}`);
+}
+
+/**
+ * 是否给出了初始化参数，用来区分「切换模型」和「初始化顺带指定模型」。
+ * 注意不含 --profile：它既能当初始化参数，也能给 --profile-model 指定目标，
+ * 单独出现时不足以说明用户想初始化。
+ */
+function isInitRequest(options) {
+  return Boolean(options.outputDir || options.baseUrl || options.apiKey);
+}
+
 function upsertProfile(options) {
   if (!options.outputDir || !options.profile || !options.baseUrl || !options.apiKey) {
     printUsage();
@@ -335,6 +398,11 @@ function upsertProfile(options) {
     updated_at: new Date().toISOString(),
   };
 
+  // 初始化时可以直接给这个 profile 固定模型
+  if (options.profileModel && !isClearModelInput(options.profileModel)) {
+    config.profiles[options.profile].model = resolveModel(options.profileModel, config.custom_models).key;
+  }
+
   if (options.activate || !config.active_profile) {
     config.active_profile = options.profile;
   }
@@ -348,6 +416,7 @@ function upsertProfile(options) {
   console.log(`base_url: ${config.profiles[options.profile].base_url}`);
   console.log(`root_output_dir: ${config.profiles[options.profile].root_output_dir}`);
   console.log(`active_profile: ${config.active_profile}`);
+  console.log(`profile_model: ${config.profiles[options.profile].model || '（跟随全局）'}`);
 }
 
 function deleteProfile(profileName) {
@@ -476,18 +545,21 @@ function main() {
     return;
   }
 
-  if (options.model) {
-    switchModel(options.model);
-    return;
-  }
-
   if (options.addModel) {
     addCustomModel(options);
+    if (options.model) {
+      switchModel(options.model);
+    }
     return;
   }
 
   if (options.deleteModel) {
     deleteCustomModel(options.deleteModel);
+    return;
+  }
+
+  if (options.profileModel !== undefined && !isInitRequest(options)) {
+    setProfileModel(options);
     return;
   }
 
@@ -515,7 +587,23 @@ function main() {
     return healthCheck(options);
   }
 
+  if (!isInitRequest(options)) {
+    // 只有 --model 单独出现时才是「切换全局当前模型」
+    if (options.model) {
+      switchModel(options.model);
+      return;
+    }
+
+    printUsage();
+    process.exit(1);
+  }
+
+  // 初始化和 --model 同时给出时两件事都做：先按参数建好/更新 profile，再切换全局当前模型。
+  // 以前 --model 会直接 return，把整个初始化静默吞掉。
   upsertProfile(options);
+  if (options.model) {
+    switchModel(options.model);
+  }
 }
 
 try {

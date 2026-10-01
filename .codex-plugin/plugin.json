@@ -1,6 +1,6 @@
 {
   "name": "oh-coage",
-  "version": "0.2.0+codex.20261001225333",
+  "version": "0.3.0+codex.20261001230116",
   "description": "通过可配置站点的 GPT-Image 系列 API 在 Codex 中生成和编辑图片，支持模型选择。",
   "author": {
     "name": "Four-JJJJ",

@@ -19,7 +19,7 @@ const {
   ensureDir,
   appendJsonl,
 } = require('./config-store');
-const { resolveModel, resolveConfiguredModel } = require('./models');
+const { resolveModel, resolveModelForProfile } = require('./models');
 
 const VALID_4K_SIZES = new Set(['16:9', '9:16', '2:1', '1:2', '21:9', '9:21']);
 const REQUEST_TIMEOUT_MS = 90 * 1000;
@@ -567,6 +567,7 @@ function resolveRuntimeConfig(cli) {
     baseUrl: normalizeBaseUrl(cli.baseUrl || process.env.IMAGES2_GEN_BASE_URL || DEFAULT_BASE_URL),
     rootOutputDir: cli.outDir ? path.resolve(cli.outDir) : null,
     outputOverride: cli.output || null,
+    modelInput: null,
     source: cli.apiKey ? 'cli' : 'env',
   }] : [];
 
@@ -576,6 +577,8 @@ function resolveRuntimeConfig(cli) {
     baseUrl: normalizeBaseUrl(cli.baseUrl || process.env.IMAGES2_GEN_BASE_URL || profile.base_url || DEFAULT_BASE_URL),
     rootOutputDir: cli.outDir ? path.resolve(cli.outDir) : path.resolve(profile.resolved_root_output_dir || profile.root_output_dir || profile.output_dir || process.cwd()),
     outputOverride: cli.output || null,
+    // profile 可以固定自己的模型；没有就跟随全局
+    modelInput: profile.model || null,
     source: 'profile',
   }));
 
@@ -588,33 +591,44 @@ function resolveRuntimeConfig(cli) {
     process.exit(1);
   }
 
-  // base_url 不合法（拼错、用了非 http/https 协议）的 profile 直接跳过，不拖垮整轮 fallback
+  // --model 是本次全局指定的，先解析一次：写错了就直接报错，不在每个候选上重复失败
+  const cliModelEntry = cli.model ? resolveModel(cli.model, config?.custom_models) : null;
+
+  // base_url 不合法（拼错、用了非 http/https 协议）或固定了未知模型的 profile
+  // 直接跳过，不拖垮整轮 fallback
   const usableCandidates = [];
   for (const candidate of candidates) {
     try {
       assertValidBaseUrl(candidate.baseUrl);
-      usableCandidates.push(candidate);
     } catch (error) {
       process.stderr.write(`跳过 profile=${candidate.name}：${error.message}\n`);
+      continue;
     }
+
+    try {
+      candidate.model = resolveModelForProfile({
+        cliModelEntry,
+        profileModelKey: candidate.modelInput,
+        config,
+      });
+    } catch (error) {
+      process.stderr.write(`跳过 profile=${candidate.name}：${error.message.split('\n')[0]}\n`);
+      continue;
+    }
+
+    usableCandidates.push(candidate);
   }
 
   if (!usableCandidates.length) {
-    throw new Error('没有 base_url 合法的 profile 可尝试，请运行 setup.js --health-check 检查配置。');
+    throw new Error('没有可用的 profile 可尝试，请运行 setup.js --health-check 检查配置。');
   }
-
-  // 模型解析：--model 优先，其次配置里的 current_model，最后默认
-  const model = cli.model
-    ? resolveModel(cli.model, config?.custom_models)
-    : resolveConfiguredModel(config);
 
   return {
     candidates: usableCandidates,
-    model,
   };
 }
 
-function buildLogRecordBase(cli, startedAt, model) {
+function buildLogRecordBase(cli, startedAt) {
   return {
     started_at: startedAt.toISOString(),
     prompt: cli.prompt,
@@ -623,9 +637,8 @@ function buildLogRecordBase(cli, startedAt, model) {
     image_url_count: cli.imageUrls.length,
     size: cli.size,
     resolution: cli.resolution,
-    model: model.model,
-    model_key: model.key,
-    model_source: model.source,
+    // 实际使用的模型可能因候选 profile 而异，成功后再补 model/model_key/model_source
+    requested_model: cli.model || null,
     explicit_profile: cli.profile || null,
     auto_fallback: cli.autoFallback,
   };
@@ -637,11 +650,14 @@ function writeRunLog(record) {
 
 const RETRY_DELAY_MS = { rate_limit: 1500, network: 1000, upstream: 1000 };
 
-async function runCandidate(candidate, cli, finalResolution, runRecord, model) {
+async function runCandidate(candidate, cli, finalResolution, runRecord) {
   const attemptStartedAt = new Date();
   const attempt = {
     profile: candidate.name,
     base_url: candidate.baseUrl,
+    model: candidate.model.model,
+    model_key: candidate.model.key,
+    model_source: candidate.model.source,
     started_at: attemptStartedAt.toISOString(),
   };
 
@@ -660,9 +676,9 @@ async function runCandidate(candidate, cli, finalResolution, runRecord, model) {
   }
 
   const mode = cli.imageUrls.length > 0 ? '图生图' : '文生图';
-  process.stderr.write(`正在提交${mode}任务: profile=${candidate.name}, base_url=${candidate.baseUrl}, model=${model.model}, prompt=${cli.prompt}, size=${cli.size}, resolution=${finalResolution}\n`);
-  if (model.source === 'default' && !cli.model) {
-    process.stderr.write(`提示：当前使用默认模型 ${model.model}，可用 setup.js --model 切换。\n`);
+  process.stderr.write(`正在提交${mode}任务: profile=${candidate.name}, base_url=${candidate.baseUrl}, model=${candidate.model.model}, prompt=${cli.prompt}, size=${cli.size}, resolution=${finalResolution}\n`);
+  if (candidate.model.source === 'default') {
+    process.stderr.write(`提示：当前使用默认模型 ${candidate.model.model}，可用 setup.js --model 切换。\n`);
   }
   if (cli.imageUrls.length > 0) {
     process.stderr.write(`参考图片: ${cli.imageUrls.length} 张\n`);
@@ -672,7 +688,7 @@ async function runCandidate(candidate, cli, finalResolution, runRecord, model) {
   for (let index = 1; index <= MAX_RETRY_ATTEMPTS; index++) {
     attempt.try_count = index;
     try {
-      const submitted = await submitGeneration(candidateApiKey, candidate.baseUrl, cli.prompt, cli.size, finalResolution, cli.imageUrls, model.model);
+      const submitted = await submitGeneration(candidateApiKey, candidate.baseUrl, cli.prompt, cli.size, finalResolution, cli.imageUrls, candidate.model.model);
       attempt.response_mode = submitted.mode;
 
       const image = submitted.mode === 'async'
@@ -694,8 +710,8 @@ async function runCandidate(candidate, cli, finalResolution, runRecord, model) {
         prompt: cli.prompt,
         profile: candidate.name,
         base_url: candidate.baseUrl,
-        model: model.model,
-        model_key: model.key,
+        model: candidate.model.model,
+        model_key: candidate.model.key,
         size: cli.size,
         resolution: finalResolution,
         started_at: attemptStartedAt.toISOString(),
@@ -740,7 +756,7 @@ async function main() {
   const runtime = resolveRuntimeConfig(cli);
   const startedAt = new Date();
   const runRecord = {
-    ...buildLogRecordBase(cli, startedAt, runtime.model),
+    ...buildLogRecordBase(cli, startedAt),
     attempts: [],
   };
 
@@ -754,12 +770,15 @@ async function main() {
     const candidate = runtime.candidates[index];
 
     try {
-      const result = await runCandidate(candidate, cli, finalResolution, runRecord, runtime.model);
+      const result = await runCandidate(candidate, cli, finalResolution, runRecord);
       const completedAt = new Date();
       runRecord.status = 'success';
       runRecord.completed_at = completedAt.toISOString();
       runRecord.duration_ms = completedAt.getTime() - startedAt.getTime();
       runRecord.selected_profile = candidate.name;
+      runRecord.model = candidate.model.model;
+      runRecord.model_key = candidate.model.key;
+      runRecord.model_source = candidate.model.source;
       runRecord.saved_path = result.savedPath || null;
       runRecord.run_dir = result.runDir || null;
       writeRunLog(runRecord);
@@ -793,6 +812,9 @@ async function main() {
       runRecord.status = 'failed';
       runRecord.completed_at = failedAt.toISOString();
       runRecord.duration_ms = failedAt.getTime() - startedAt.getTime();
+      runRecord.model = candidate.model.model;
+      runRecord.model_key = candidate.model.key;
+      runRecord.model_source = candidate.model.source;
       runRecord.final_error = truncateForLog(error.message, MAX_LOG_ERROR_LENGTH);
       runRecord.final_error_kind = classification.kind;
       runRecord.final_status_code = classification.statusCode;

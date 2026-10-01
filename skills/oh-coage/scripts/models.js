@@ -106,6 +106,30 @@ function resolveConfiguredModel(config) {
   return { ...defaultCatalogEntry(catalog), source: 'default' };
 }
 
+/**
+ * 解析某个候选 profile 实际要用的模型，优先级：
+ *   --model（本次显式指定） > profile.model（该 profile 固定） > config.current_model > 默认
+ *
+ * cliModelEntry 需要调用方先用 resolveModel 解析好，这样非法的 --model 只需报错一次，
+ * 而不是在每个候选上重复失败。
+ */
+function resolveModelForProfile({ cliModelEntry, profileModelKey, config } = {}) {
+  if (cliModelEntry) {
+    return { ...cliModelEntry, source: 'cli' };
+  }
+
+  if (profileModelKey) {
+    return { ...resolveModel(profileModelKey, config?.custom_models), source: 'profile' };
+  }
+
+  return resolveConfiguredModel(config);
+}
+
+/** --profile-model 接受这些值表示「取消固定，跟随全局当前模型」。 */
+function isClearModelInput(value) {
+  return ['none', 'default', 'clear', 'auto'].includes(normalizeModelInput(value));
+}
+
 function isBuiltinModelKey(key) {
   const raw = normalizeModelInput(key);
   return BUILTIN_MODELS.some((entry) => normalizeModelInput(entry.key) === raw);
@@ -118,6 +142,8 @@ module.exports = {
   formatModelOptions,
   resolveModel,
   resolveConfiguredModel,
+  resolveModelForProfile,
+  isClearModelInput,
   isBuiltinModelKey,
   normalizeModelInput,
 };

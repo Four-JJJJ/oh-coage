@@ -29,9 +29,9 @@ function createTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'oh-coage-model-'));
 }
 
-function runNode(scriptPath, args, home) {
+function runNode(scriptPath, args, home, extraEnv = {}) {
   return new Promise((resolve) => {
-    const env = { ...process.env, HOME: home };
+    const env = { ...process.env, HOME: home, ...extraEnv };
     delete env.OH_COAGE_TEST;
 
     const child = spawn(process.execPath, [scriptPath, ...args], {
@@ -45,6 +45,57 @@ function runNode(scriptPath, args, home) {
     child.stdout.on('data', (chunk) => { stdout += chunk; });
     child.stderr.on('data', (chunk) => { stderr += chunk; });
     child.on('close', (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+/**
+ * 造一个假的 security 命令并排到 PATH 前面，这样能完整跑初始化流程，
+ * 又不会碰用户真实的登录钥匙串。
+ */
+function createSecurityStub(t) {
+  const binDir = createTempDir();
+  t.after(() => fs.rmSync(binDir, { recursive: true, force: true }));
+
+  const stubPath = path.join(binDir, 'security');
+  fs.writeFileSync(stubPath, [
+    '#!/bin/bash',
+    'case "$1" in',
+    '  add-generic-password) cat > /dev/null; exit 0 ;;',
+    '  find-generic-password) echo "stub-api-key"; exit 0 ;;',
+    '  delete-generic-password) exit 0 ;;',
+    'esac',
+    'exit 0',
+    '',
+  ].join('\n'));
+  fs.chmodSync(stubPath, 0o755);
+
+  return { binDir, env: { PATH: `${binDir}${path.delimiter}${process.env.PATH}` } };
+}
+
+function startImageServer(bodies) {
+  const server = http.createServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/v1/images/generations') {
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => {
+        bodies.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ data: [{ b64_json: PNG_BASE64 }] }));
+      });
+      return;
+    }
+
+    res.writeHead(404);
+    res.end();
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      resolve({
+        origin: `http://127.0.0.1:${server.address().port}`,
+        close: () => new Promise((done) => server.close(done)),
+      });
+    });
   });
 }
 
@@ -249,5 +300,135 @@ test('generate records the model it used in the run log', async (t) => {
 
   assert.equal(runs.at(-1).model, 'gpt-image-2.5-flare');
   assert.equal(runs.at(-1).model_key, 'image-2.5-flare');
-  assert.equal(runs.at(-1).model_source, 'key');
+  assert.equal(runs.at(-1).model_source, 'cli', '--model 显式指定的来源应标记为 cli');
+  assert.equal(runs.at(-1).requested_model, 'image-2.5-flare');
+});
+
+test('init and --model can be combined: both take effect', async (t) => {
+  const home = createTempDir();
+  const outputDir = createTempDir();
+  const stub = createSecurityStub(t);
+  t.after(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  });
+
+  const result = await runNode(setupPath, [
+    '--output-dir', outputDir,
+    '--profile', 'main',
+    '--base-url', 'https://a.example/v1',
+    '--api-key', 'stub-key',
+    '--activate',
+    '--model', 'image-2.5-flare',
+  ], home, stub.env);
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /配置已保存/, '初始化必须真的执行，不能被 --model 吞掉');
+  assert.match(result.stdout, /已切换当前模型: image-2\.5-flare/);
+
+  const config = JSON.parse(fs.readFileSync(path.join(outputDir, 'oh-coage-config.json'), 'utf8'));
+  assert.equal(config.active_profile, 'main');
+  assert.equal(config.current_model, 'image-2.5-flare');
+  assert.ok(config.profiles.main.keychain_account, 'profile 应已建立');
+});
+
+test('--profile-model pins and clears a profile model', async (t) => {
+  const ctx = scaffold(t, BASE_CONFIG);
+
+  const pinned = await runNode(
+    setupPath,
+    ['--profile-model', 'image-2.5-sunburst', '--profile', 'main'],
+    ctx.home,
+  );
+  assert.equal(pinned.code, 0, pinned.stderr);
+  assert.equal(ctx.readConfig().profiles.main.model, 'image-2.5-sunburst');
+
+  const listed = await runNode(setupPath, ['--list'], ctx.home);
+  assert.match(listed.stdout, /\[model: image-2\.5-sunburst\]/);
+
+  const cleared = await runNode(
+    setupPath,
+    ['--profile-model', 'none', '--profile', 'main'],
+    ctx.home,
+  );
+  assert.equal(cleared.code, 0, cleared.stderr);
+  assert.equal(ctx.readConfig().profiles.main.model, undefined);
+});
+
+test('a profile-pinned model wins over the global one, and --model overrides both', async (t) => {
+  const stub = createSecurityStub(t);
+  const bodies = [];
+  const server = await startImageServer(bodies);
+  t.after(server.close);
+
+  const ctx = scaffold(t, {
+    version: 1,
+    active_profile: 'main',
+    current_model: 'image-2',
+    profiles: {
+      main: {
+        base_url: `${server.origin}/v1`,
+        root_output_dir: '.',
+        keychain_account: 'main:x',
+        model: 'image-2.5-sunburst',
+      },
+    },
+  });
+
+  const outputDir = createTempDir();
+  t.after(() => fs.rmSync(outputDir, { recursive: true, force: true }));
+
+  const args = ['--prompt', 'a red apple', '--out-dir', outputDir, '--no-fallback'];
+
+  const pinned = await runNode(generatePath, args, ctx.home, stub.env);
+  assert.equal(pinned.code, 0, pinned.stderr);
+  assert.equal(bodies.at(-1).model, 'gpt-image-2.5-sunburst', 'profile 固定的模型应生效');
+
+  const runs = fs.readFileSync(path.join(ctx.home, '.oh-coage', 'runs.jsonl'), 'utf8')
+    .trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(runs.at(-1).model_source, 'profile');
+
+  const overridden = await runNode(generatePath, [...args, '--model', 'image-2.5-flare'], ctx.home, stub.env);
+  assert.equal(overridden.code, 0, overridden.stderr);
+  assert.equal(bodies.at(-1).model, 'gpt-image-2.5-flare', '--model 应压过 profile 固定的模型');
+  assert.equal(ctx.readConfig().profiles.main.model, 'image-2.5-sunburst', '--model 不应改动 profile');
+});
+
+test('a profile pinned to an unknown model is skipped instead of aborting the run', async (t) => {
+  const stub = createSecurityStub(t);
+  const bodies = [];
+  const server = await startImageServer(bodies);
+  t.after(server.close);
+
+  const ctx = scaffold(t, {
+    version: 1,
+    active_profile: 'broken',
+    current_model: 'image-2',
+    profiles: {
+      broken: {
+        base_url: `${server.origin}/v1`,
+        root_output_dir: '.',
+        keychain_account: 'broken:x',
+        model: 'ghost-model',
+      },
+      good: {
+        base_url: `${server.origin}/v1`,
+        root_output_dir: '.',
+        keychain_account: 'good:x',
+      },
+    },
+  });
+
+  const outputDir = createTempDir();
+  t.after(() => fs.rmSync(outputDir, { recursive: true, force: true }));
+
+  const result = await runNode(generatePath, [
+    '--prompt', 'a red apple',
+    '--out-dir', outputDir,
+  ], ctx.home, stub.env);
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stderr, /跳过 profile=broken/);
+  assert.match(result.stderr, /未知模型/);
+  assert.equal(bodies.at(-1).model, 'gpt-image-2', '应回退到下一个 profile 并跟随全局模型');
 });

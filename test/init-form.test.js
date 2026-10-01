@@ -8,12 +8,15 @@ const formPath = path.resolve(__dirname, '../skills/oh-coage/assets/oh-coage-ini
 test('initialization form contains the required fields and follow-up bridge', () => {
   const source = fs.readFileSync(formPath, 'utf8');
 
-  for (const field of ['outputDir', 'profile', 'baseUrl', 'apiKey']) {
+  for (const field of ['outputDir', 'profile', 'baseUrl', 'apiKey', 'model']) {
     assert.match(source, new RegExp(`name="${field}"`));
   }
 
   assert.match(source, /type="password"/);
   assert.match(source, /name="outputDir"/);
+  assert.match(source, /<select[^>]*name="model"/);
+  assert.match(source, /image-2\.5-sunburst/);
+  assert.match(source, /image-2\.5-flare/);
   assert.match(source, /初始化 oh-coage/);
   assert.match(source, /gap: 8px/);
   assert.match(source, /gap: 20px/);
