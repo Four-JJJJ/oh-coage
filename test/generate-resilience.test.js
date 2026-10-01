@@ -321,3 +321,14 @@ test('an unsupported base_url protocol is rejected with a clear message', async 
   assert.equal(result.code, 1);
   assert.match(result.stderr, /仅支持 http\/https/);
 });
+
+test('generate gives a clear error for a flag missing its value instead of a TypeError', async (t) => {
+  const home = createTempDir();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const result = await runGenerate(['--prompt', 'a red apple', '--image-url'], home);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /--image-url 缺少参数值/);
+  assert.doesNotMatch(result.stderr, /TypeError/);
+});

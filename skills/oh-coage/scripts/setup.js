@@ -41,7 +41,15 @@ function parseArgs() {
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
-      case '--output-dir': parsed.outputDir = path.resolve(args[++i]); break;
+      case '--output-dir': {
+        const value = args[++i];
+        if (!value) {
+          console.error('--output-dir 缺少参数值。');
+          process.exit(1);
+        }
+        parsed.outputDir = path.resolve(value);
+        break;
+      }
       case '--profile': parsed.profile = args[++i]; break;
       case '--base-url': parsed.baseUrl = args[++i]; break;
       case '--api-key': parsed.apiKey = args[++i]; break;
@@ -136,6 +144,7 @@ function probeUrl(url, timeoutMs = 8000) {
   return new Promise((resolve) => {
     const mod = url.startsWith('https') ? https : http;
     const req = mod.request(url, { method: 'GET' }, (res) => {
+      res.on('error', (error) => resolve({ reachable: false, error: error.message }));
       res.resume();
       resolve({ reachable: true, statusCode: res.statusCode });
     });
@@ -168,9 +177,13 @@ async function healthCheck(options) {
 
     try {
       const rootOutputDir = profile.resolved_root_output_dir || profile.root_output_dir || profile.output_dir;
-      ensureDir(rootOutputDir);
-      fs.accessSync(rootOutputDir, fs.constants.W_OK);
-      checks.push({ item: 'root_output_dir', ok: true, detail: `${profile.root_output_dir || profile.output_dir} -> ${rootOutputDir}` });
+      if (!rootOutputDir) {
+        checks.push({ item: 'root_output_dir', ok: false, detail: 'profile 未配置输出目录' });
+      } else {
+        ensureDir(rootOutputDir);
+        fs.accessSync(rootOutputDir, fs.constants.W_OK);
+        checks.push({ item: 'root_output_dir', ok: true, detail: `${profile.root_output_dir || profile.output_dir} -> ${rootOutputDir}` });
+      }
     } catch (error) {
       checks.push({ item: 'root_output_dir', ok: false, detail: error.message });
     }

@@ -108,6 +108,8 @@ function request(url, options, body, timeoutMs = REQUEST_TIMEOUT_MS) {
     const mod = url.startsWith('https') ? https : http;
     const req = mod.request(url, options, (res) => {
       const chunks = [];
+      // 响应流中途出错（如连接被重置）会触发 'error'，不处理会变成未捕获异常直接崩进程
+      res.on('error', reject);
       res.on('data', (chunk) => { chunks.push(chunk); });
       res.on('end', () => {
         const raw = Buffer.concat(chunks).toString('utf-8');
@@ -498,26 +500,29 @@ function parseArgs() {
   const args = process.argv.slice(2);
   const parsed = { size: '1:1', resolution: '2k', imageUrls: [], autoFallback: true };
 
+  // 取值并校验「后面确实跟着一个非 -- 的值」，避免缺值时后续 path.resolve / 读文件抛难懂的 TypeError
+  const value = (index, flag) => {
+    const next = args[index + 1];
+    if (next === undefined || next.startsWith('--')) {
+      console.error(`${flag} 缺少参数值。`);
+      process.exit(1);
+    }
+    return next;
+  };
+
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
+      // prompt 允许以 - 开头，且缺失会在下面统一拦截
       case '--prompt': parsed.prompt = args[++i]; break;
-      case '--model': {
-        const modelValue = args[++i];
-        if (!modelValue || modelValue.startsWith('--')) {
-          console.error('--model 需要一个模型短名或 model ID，例如：--model image-2.5-flare');
-          process.exit(1);
-        }
-        parsed.model = modelValue;
-        break;
-      }
-      case '--size': parsed.size = args[++i]; break;
-      case '--resolution': parsed.resolution = args[++i]; break;
-      case '--image-url': parsed.imageUrls.push(args[++i]); break;
-      case '--base-url': parsed.baseUrl = args[++i]; break;
-      case '--api-key': parsed.apiKey = args[++i]; break;
-      case '--output': parsed.output = path.resolve(args[++i]); break;
-      case '--out-dir': parsed.outDir = path.resolve(args[++i]); break;
-      case '--profile': parsed.profile = args[++i]; break;
+      case '--model': parsed.model = value(i++, '--model'); break;
+      case '--size': parsed.size = value(i++, '--size'); break;
+      case '--resolution': parsed.resolution = value(i++, '--resolution'); break;
+      case '--image-url': parsed.imageUrls.push(value(i++, '--image-url')); break;
+      case '--base-url': parsed.baseUrl = value(i++, '--base-url'); break;
+      case '--api-key': parsed.apiKey = value(i++, '--api-key'); break;
+      case '--output': parsed.output = path.resolve(value(i++, '--output')); break;
+      case '--out-dir': parsed.outDir = path.resolve(value(i++, '--out-dir')); break;
+      case '--profile': parsed.profile = value(i++, '--profile'); break;
       case '--no-fallback': parsed.autoFallback = false; break;
     }
   }
@@ -542,6 +547,13 @@ function resolveRuntimeConfig(cli) {
   const activeProfileName = config?.active_profile;
   const explicitProfile = cli.profile;
   const profiles = config?.profiles || {};
+
+  // 安全提示：--base-url 覆盖站点地址后，若仍从 Keychain 取 key，会把该 key 发到新地址。
+  // 这是「临时测试新站点」的合法用法，但要让用户知道代价，避免被诱导把真实 key 发到不可信主机。
+  const baseUrlOverridden = Boolean(cli.baseUrl || process.env.IMAGES2_GEN_BASE_URL);
+  if (baseUrlOverridden && !cli.apiKey && !process.env.IMAGES2_GEN_API_KEY && Object.keys(profiles).length > 0) {
+    process.stderr.write('警告：本次用 --base-url 覆盖了站点地址，但仍会使用 profile 存于 Keychain 的 API Key，该 key 会被发送到上面的新地址。请确认目标地址可信；临时测试新站点建议同时用 --api-key 显式传一个测试 key。\n');
+  }
 
   if (!cli.apiKey && !process.env.IMAGES2_GEN_API_KEY && !Object.keys(profiles).length) {
     printSetupInstructions();

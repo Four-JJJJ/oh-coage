@@ -432,3 +432,20 @@ test('a profile pinned to an unknown model is skipped instead of aborting the ru
   assert.match(result.stderr, /未知模型/);
   assert.equal(bodies.at(-1).model, 'gpt-image-2', '应回退到下一个 profile 并跟随全局模型');
 });
+
+test('generate warns when --base-url overrides the site but still uses the Keychain key', async (t) => {
+  const stub = createSecurityStub(t);
+  const ctx = scaffold(t, BASE_CONFIG);
+  const outputDir = createTempDir();
+  t.after(() => fs.rmSync(outputDir, { recursive: true, force: true }));
+
+  const result = await runNode(generatePath, [
+    '--prompt', 'a red apple',
+    '--base-url', 'http://127.0.0.1:1/v1',
+    '--out-dir', outputDir,
+    '--no-fallback',
+  ], ctx.home, stub.env);
+
+  assert.match(result.stderr, /警告：本次用 --base-url 覆盖了站点地址/);
+  assert.match(result.stderr, /--api-key/);
+});
