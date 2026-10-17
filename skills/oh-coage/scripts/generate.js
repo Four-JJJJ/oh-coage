@@ -154,7 +154,7 @@ function extractImagePayload(result) {
   return { imageUrl, base64 };
 }
 
-async function submitGeneration(apiKey, baseUrl, prompt, size, resolution, imageUrls, model) {
+async function submitGeneration(apiKey, baseUrl, prompt, size, resolution, imageUrls, model, quality, style, responseFormat, user) {
   const body = {
     model,
     prompt,
@@ -165,6 +165,20 @@ async function submitGeneration(apiKey, baseUrl, prompt, size, resolution, image
 
   if (imageUrls.length > 0) {
     body.image_urls = imageUrls;
+  }
+
+  // 添加可选参数
+  if (quality) {
+    body.quality = quality;
+  }
+  if (style) {
+    body.style = style;
+  }
+  if (responseFormat) {
+    body.response_format = responseFormat;
+  }
+  if (user) {
+    body.user = user;
   }
 
   const result = await request(`${baseUrl}/images/generations`, {
@@ -553,6 +567,10 @@ function parseArgs() {
       case '--model': parsed.model = value(i++, '--model'); break;
       case '--size': parsed.size = value(i++, '--size'); break;
       case '--resolution': parsed.resolution = value(i++, '--resolution'); break;
+      case '--quality': parsed.quality = value(i++, '--quality'); break;
+      case '--style': parsed.style = value(i++, '--style'); break;
+      case '--response-format': parsed.responseFormat = value(i++, '--response-format'); break;
+      case '--user': parsed.user = value(i++, '--user'); break;
       case '--image-url': parsed.imageUrls.push(value(i++, '--image-url')); break;
       case '--base-url': parsed.baseUrl = value(i++, '--base-url'); break;
       case '--api-key': parsed.apiKey = value(i++, '--api-key'); break;
@@ -564,7 +582,7 @@ function parseArgs() {
   }
 
   if (!parsed.prompt) {
-    console.error('用法: node generate.js --prompt "提示词" [--model NAME] [--profile NAME] [--size 1:1] [--resolution 2k] [--image-url URL] [--base-url URL] [--api-key KEY] [--output FILE | --out-dir DIR] [--no-fallback]');
+    console.error('用法: node generate.js --prompt "提示词" [--model NAME] [--profile NAME] [--size 1:1] [--resolution 2k] [--quality QUALITY] [--style STYLE] [--response-format FORMAT] [--user USER] [--image-url URL] [--base-url URL] [--api-key KEY] [--output FILE | --out-dir DIR] [--no-fallback]');
     process.exit(1);
   }
 
@@ -736,7 +754,7 @@ async function runCandidate(candidate, cli, finalResolution, runRecord) {
   for (let index = 1; index <= MAX_RETRY_ATTEMPTS; index++) {
     attempt.try_count = index;
     try {
-      const submitted = await submitGeneration(candidateApiKey, candidate.baseUrl, cli.prompt, cli.size, finalResolution, cli.imageUrls, candidate.model.model);
+      const submitted = await submitGeneration(candidateApiKey, candidate.baseUrl, cli.prompt, cli.size, finalResolution, cli.imageUrls, candidate.model.model, cli.quality, cli.style, cli.responseFormat, cli.user);
       attempt.response_mode = submitted.mode;
 
       const image = submitted.mode === 'async'

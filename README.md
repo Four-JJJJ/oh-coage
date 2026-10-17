@@ -307,6 +307,14 @@ node "$SKILL_DIR/scripts/generate.js" [options]
   - 可选，默认 `1:1`
 - `--resolution`
   - 可选，默认 `2k`
+- `--quality`
+  - 可选，图片质量（如 `standard` / `hd`）
+- `--style`
+  - 可选，风格选择（如 `vivid` / `natural`）
+- `--response-format`
+  - 可选，响应格式（`url` / `b64_json`）
+- `--user`
+  - 可选，用户标识（用于追踪和滥用监控）
 - `--image-url`
   - 可选，图生图参考图
 - `--base-url`
