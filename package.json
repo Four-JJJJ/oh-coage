@@ -1,6 +1,6 @@
 {
   "name": "oh-coage",
-  "version": "0.5.0",
+  "version": "0.7.0",
   "private": true,
   "type": "commonjs",
   "engines": {
@@ -8,6 +8,6 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check skills/oh-coage/scripts/config-store.js && node --check skills/oh-coage/scripts/models.js && node --check skills/oh-coage/scripts/setup.js && node --check skills/oh-coage/scripts/generate.js && node --check skills/oh-coage/scripts/resolve-output-dir.js"
+    "check": "node --check skills/oh-coage/scripts/config-store.js && node --check skills/oh-coage/scripts/models.js && node --check skills/oh-coage/scripts/providers.js && node --check skills/oh-coage/scripts/setup.js && node --check skills/oh-coage/scripts/generate.js && node --check skills/oh-coage/scripts/resolve-output-dir.js"
   }
 }

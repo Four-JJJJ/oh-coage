@@ -20,6 +20,13 @@ const {
   appendJsonl,
 } = require('./config-store');
 const { resolveModel, resolveModelForProfile } = require('./models');
+const {
+  normalizeFamily,
+  normalizeApiStyle,
+  buildRequest,
+  extractImages,
+  resolveEndpointBaseUrl,
+} = require('./providers');
 
 const VALID_4K_SIZES = new Set(['16:9', '9:16', '2:1', '1:2', '21:9', '9:21']);
 const REQUEST_TIMEOUT_MS = 90 * 1000;
@@ -154,49 +161,20 @@ function extractImagePayload(result) {
   return { imageUrl, base64 };
 }
 
-async function submitGeneration(apiKey, baseUrl, prompt, size, resolution, imageUrls, model, quality, style, responseFormat, user) {
-  const body = {
-    model,
-    prompt,
-    n: 1,
-    size,
-    resolution,
-  };
-
-  if (imageUrls.length > 0) {
-    body.image_urls = imageUrls;
-  }
-
-  // 添加可选参数
-  if (quality) {
-    body.quality = quality;
-  }
-  if (style) {
-    body.style = style;
-  }
-  if (responseFormat) {
-    body.response_format = responseFormat;
-  }
-  if (user) {
-    body.user = user;
-  }
-
-  const result = await request(`${baseUrl}/images/generations`, {
+async function submitGeneration({ apiKey, baseUrl, family, apiStyle, params }) {
+  const requestSpec = buildRequest({ family, apiStyle, ...params, apiKey });
+  const endpointBase = resolveEndpointBaseUrl({ family, apiStyle, baseUrl });
+  const result = await request(`${endpointBase}${requestSpec.path}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
+      ...requestSpec.headers,
     },
-  }, JSON.stringify(body), REQUEST_TIMEOUT_MS);
+  }, JSON.stringify(requestSpec.body), REQUEST_TIMEOUT_MS);
 
-  const taskId = result?.data?.[0]?.task_id || result?.data?.task_id || result?.task_id;
-  if (taskId) {
-    return { mode: 'async', taskId };
-  }
-
-  const image = extractImagePayload(result);
-  if (image.imageUrl || image.base64) {
-    return { mode: 'sync', image };
+  const extracted = extractImages({ family, apiStyle }, result);
+  if (extracted.mode === 'async' || extracted.images.length > 0) {
+    return extracted;
   }
 
   throw new Error(`无法识别生成接口返回结构: ${truncateForLog(JSON.stringify(result), MAX_ERROR_SNIPPET)}`);
@@ -370,14 +348,17 @@ function formatTimestampForDir(date = new Date()) {
   ].join('');
 }
 
-function buildOutputPath(output, extension, runDir) {
+function buildOutputPath(output, extension, runDir, index = 0) {
   if (output) {
     ensureDir(path.dirname(output));
-    return output;
+    // 多图时第 1 张用用户指定文件名，后续追加序号，避免互相覆盖
+    if (index === 0) return output;
+    const ext = path.extname(output);
+    return `${output.slice(0, -ext.length || undefined)}-${index + 1}${ext}`;
   }
 
   ensureDir(runDir);
-  return path.join(runDir, `oh-coage-${Date.now()}${extension}`);
+  return path.join(runDir, `oh-coage-${Date.now()}${index ? `-${index + 1}` : ''}${extension}`);
 }
 
 /** 判断主机名是否指向本地/内网/保留地址。用于下载前给出 SSRF 提示。 */
@@ -508,7 +489,7 @@ function writeRunMeta(runDir, meta) {
   fs.writeFileSync(path.join(runDir, 'meta.json'), `${JSON.stringify(meta, null, 2)}\n`);
 }
 
-async function saveImage(image, output, runDir) {
+async function saveImage(image, output, runDir, index = 0) {
   if (!output && !runDir) {
     return null;
   }
@@ -520,7 +501,7 @@ async function saveImage(image, output, runDir) {
       throw new Error('base64 图片格式不合法');
     }
 
-    const filePath = buildOutputPath(output, inferExtension(meta, dataUri), runDir);
+    const filePath = buildOutputPath(output, inferExtension(meta, dataUri), runDir, index);
     fs.writeFileSync(filePath, Buffer.from(encoded, 'base64'));
     return filePath;
   }
@@ -528,7 +509,7 @@ async function saveImage(image, output, runDir) {
   if (image.imageUrl) {
     // 先按 URL 猜扩展名落到磁盘，下载后再按响应头纠正
     const guessedExtension = inferExtensionFromUrl(image.imageUrl) || '.png';
-    const filePath = buildOutputPath(output, guessedExtension, runDir);
+    const filePath = buildOutputPath(output, guessedExtension, runDir, index);
     const contentType = await downloadToFile(image.imageUrl, filePath);
 
     if (!output) {
@@ -548,7 +529,7 @@ async function saveImage(image, output, runDir) {
 
 function parseArgs() {
   const args = process.argv.slice(2);
-  const parsed = { size: '1:1', resolution: '2k', imageUrls: [], autoFallback: true };
+  const parsed = { imageUrls: [], autoFallback: true };
 
   // 取值并校验「后面确实跟着一个非 -- 的值」，避免缺值时后续 path.resolve / 读文件抛难懂的 TypeError
   const value = (index, flag) => {
@@ -564,10 +545,18 @@ function parseArgs() {
     switch (args[i]) {
       // prompt 允许以 - 开头，且缺失会在下面统一拦截
       case '--prompt': parsed.prompt = args[++i]; break;
+      case '--family': parsed.family = value(i++, '--family'); break;
+      case '--api': parsed.apiStyle = value(i++, '--api'); break;
       case '--model': parsed.model = value(i++, '--model'); break;
       case '--size': parsed.size = value(i++, '--size'); break;
       case '--resolution': parsed.resolution = value(i++, '--resolution'); break;
+      case '--image-size': parsed.imageSize = value(i++, '--image-size'); break;
+      case '--n': parsed.n = value(i++, '--n'); break;
       case '--quality': parsed.quality = value(i++, '--quality'); break;
+      case '--background': parsed.background = value(i++, '--background'); break;
+      case '--output-format': parsed.outputFormat = value(i++, '--output-format'); break;
+      case '--output-compression': parsed.outputCompression = value(i++, '--output-compression'); break;
+      case '--moderation': parsed.moderation = value(i++, '--moderation'); break;
       case '--style': parsed.style = value(i++, '--style'); break;
       case '--response-format': parsed.responseFormat = value(i++, '--response-format'); break;
       case '--user': parsed.user = value(i++, '--user'); break;
@@ -582,7 +571,7 @@ function parseArgs() {
   }
 
   if (!parsed.prompt) {
-    console.error('用法: node generate.js --prompt "提示词" [--model NAME] [--profile NAME] [--size 1:1] [--resolution 2k] [--quality QUALITY] [--style STYLE] [--response-format FORMAT] [--user USER] [--image-url URL] [--base-url URL] [--api-key KEY] [--output FILE | --out-dir DIR] [--no-fallback]');
+    console.error('用法: node generate.js --prompt "提示词" [--family openai|gemini|grok] [--api openai|official] [--model NAME] [--profile NAME] [--size SIZE] [--resolution 1k|2k|4k] [--image-size 512|1K|2K|4K] [--n COUNT] [--quality QUALITY] [--style STYLE] [--background auto] [--output-format png] [--output-compression 0-100] [--moderation auto] [--response-format url] [--user USER] [--image-url URL] [--base-url URL] [--api-key KEY] [--output FILE | --out-dir DIR] [--no-fallback]');
     process.exit(1);
   }
 
@@ -627,30 +616,82 @@ function resolveRuntimeConfig(cli) {
     throw new Error(`profile 不存在: ${explicitProfile}`);
   }
 
+  // --family / --api 是本次显式覆盖；没给就跟随 profile，profile 再没写就是 openai。
+  // 默认全部走 OpenAI 兼容接口，Gemini / Grok 只有在用户明确指定时才发官方协议。
+  const cliFamily = cli.family ? normalizeFamily(cli.family) : null;
+  const cliApiStyle = cli.apiStyle ? normalizeApiStyle(cli.apiStyle, cliFamily) : null;
+
+  const profileFamily = (profile) => {
+    try {
+      return normalizeFamily(profile?.family || 'openai');
+    } catch {
+      return 'openai';
+    }
+  };
+  const profileApiStyle = (profile, family) => {
+    try {
+      return normalizeApiStyle(profile?.api_style, family);
+    } catch {
+      return 'openai';
+    }
+  };
+
+  // 只传 --api-key 时，优先继承当前活跃 profile 的地址/模型族/协议，
+  // 否则会回落到 DEFAULT_BASE_URL 那个示例域名，把请求发错地方。
+  const fallbackProfileName = explicitProfile || activeProfileName;
+  const baseProfileConfig = fallbackProfileName ? profiles[fallbackProfileName] : null;
+  const manualFamily = cliFamily || (baseProfileConfig ? profileFamily(baseProfileConfig) : 'openai');
+  const manualApiStyle = cliApiStyle || (baseProfileConfig ? profileApiStyle(baseProfileConfig, manualFamily) : 'openai');
+
   const manualCandidate = cli.apiKey ? [{
     name: explicitProfile || 'manual',
     apiKey: cli.apiKey || process.env.IMAGES2_GEN_API_KEY,
-    baseUrl: normalizeBaseUrl(cli.baseUrl || process.env.IMAGES2_GEN_BASE_URL || DEFAULT_BASE_URL),
+    baseUrl: normalizeBaseUrl(cli.baseUrl || process.env.IMAGES2_GEN_BASE_URL || baseProfileConfig?.base_url || DEFAULT_BASE_URL),
     rootOutputDir: cli.outDir ? path.resolve(cli.outDir) : null,
     outputOverride: cli.output || null,
-    modelInput: null,
+    modelInput: baseProfileConfig?.model || null,
+    family: manualFamily,
+    apiStyle: manualApiStyle,
     source: cli.apiKey ? 'cli' : 'env',
   }] : [];
 
-  const configCandidates = candidateProfiles.map(([name, profile]) => ({
-    name,
-    keychainAccount: profile.keychain_account,
-    baseUrl: normalizeBaseUrl(cli.baseUrl || process.env.IMAGES2_GEN_BASE_URL || profile.base_url || DEFAULT_BASE_URL),
-    rootOutputDir: cli.outDir ? path.resolve(cli.outDir) : path.resolve(profile.resolved_root_output_dir || profile.root_output_dir || profile.output_dir || process.cwd()),
-    outputOverride: cli.output || null,
-    // profile 可以固定自己的模型；没有就跟随全局
-    modelInput: profile.model || null,
-    source: 'profile',
-  }));
+  const configCandidates = candidateProfiles.map(([name, profile]) => {
+    const declaredFamily = profileFamily(profile);
+    return {
+      name,
+      keychainAccount: profile.keychain_account,
+      baseUrl: normalizeBaseUrl(cli.baseUrl || process.env.IMAGES2_GEN_BASE_URL || profile.base_url || DEFAULT_BASE_URL),
+      rootOutputDir: cli.outDir ? path.resolve(cli.outDir) : path.resolve(profile.resolved_root_output_dir || profile.root_output_dir || profile.output_dir || process.cwd()),
+      outputOverride: cli.output || null,
+      // profile 可以固定自己的模型；没有就跟随全局
+      modelInput: profile.model || null,
+      // 这里用 profile 自己声明的族，--family 只用来过滤，不拿来改 profile 的身份
+      family: declaredFamily,
+      apiStyle: cliApiStyle || profileApiStyle(profile, declaredFamily),
+      source: 'profile',
+    };
+  });
 
-  const candidates = manualCandidate.length > 0
+  // 用户点名了模型族或接口协议，就只留匹配的候选，避免把 Gemini 模型发给 OpenAI 网关
+  const matchesRequest = (candidate) => (
+    (!cliFamily || candidate.family === cliFamily)
+    && (!cliApiStyle || candidate.apiStyle === cliApiStyle)
+  );
+
+  let candidates = manualCandidate.length > 0
     ? (cli.autoFallback ? manualCandidate.concat(configCandidates) : manualCandidate)
     : (cli.autoFallback ? configCandidates : configCandidates.slice(0, 1));
+
+  if (cliFamily || cliApiStyle) {
+    const filtered = candidates.filter(matchesRequest);
+    if (filtered.length === 0) {
+      throw new Error(
+        `没有匹配 family=${cliFamily || '*'} / api=${cliApiStyle || '*'} 的 profile。`
+        + '请先用 setup.js 添加对应配置，或去掉 --family / --api 让本次跟随 profile。',
+      );
+    }
+    candidates = filtered;
+  }
 
   if (!candidates.length) {
     printSetupInstructions();
@@ -658,7 +699,7 @@ function resolveRuntimeConfig(cli) {
   }
 
   // --model 是本次全局指定的，先解析一次：写错了就直接报错，不在每个候选上重复失败
-  const cliModelEntry = cli.model ? resolveModel(cli.model, config?.custom_models) : null;
+  const cliModelEntry = cli.model ? resolveModel(cli.model, config?.custom_models, cliFamily) : null;
 
   // base_url 不合法（拼错、用了非 http/https 协议）或固定了未知模型的 profile
   // 直接跳过，不拖垮整轮 fallback
@@ -676,6 +717,7 @@ function resolveRuntimeConfig(cli) {
         cliModelEntry,
         profileModelKey: candidate.modelInput,
         config,
+        family: candidate.family,
       });
     } catch (error) {
       process.stderr.write(`跳过 profile=${candidate.name}：${error.message.split('\n')[0]}\n`);
@@ -716,11 +758,13 @@ function writeRunLog(record) {
 
 const RETRY_DELAY_MS = { rate_limit: 1500, network: 1000, upstream: 1000 };
 
-async function runCandidate(candidate, cli, finalResolution, runRecord) {
+async function runCandidate(candidate, cli, runRecord) {
   const attemptStartedAt = new Date();
   const attempt = {
     profile: candidate.name,
     base_url: candidate.baseUrl,
+    family: candidate.family,
+    api_style: candidate.apiStyle,
     model: candidate.model.model,
     model_key: candidate.model.key,
     model_source: candidate.model.source,
@@ -742,7 +786,8 @@ async function runCandidate(candidate, cli, finalResolution, runRecord) {
   }
 
   const mode = cli.imageUrls.length > 0 ? '图生图' : '文生图';
-  process.stderr.write(`正在提交${mode}任务: profile=${candidate.name}, base_url=${candidate.baseUrl}, model=${candidate.model.model}, prompt=${cli.prompt}, size=${cli.size}, resolution=${finalResolution}\n`);
+  const interfaceLabel = candidate.apiStyle === 'official' ? `${candidate.family} 官方接口` : 'OpenAI 兼容接口';
+  process.stderr.write(`正在提交${mode}任务: profile=${candidate.name}, 接口=${interfaceLabel}, base_url=${candidate.baseUrl}, model=${candidate.model.model}, prompt=${cli.prompt}, size=${cli.size || '默认'}\n`);
   if (candidate.model.source === 'default') {
     process.stderr.write(`提示：当前使用默认模型 ${candidate.model.model}，可用 setup.js --model 切换。\n`);
   }
@@ -750,45 +795,86 @@ async function runCandidate(candidate, cli, finalResolution, runRecord) {
     process.stderr.write(`参考图片: ${cli.imageUrls.length} 张\n`);
   }
 
+  const params = {
+    prompt: cli.prompt,
+    model: candidate.model.model,
+    size: cli.size,
+    resolution: cli.resolution,
+    imageSize: cli.imageSize,
+    n: cli.n,
+    quality: cli.quality,
+    style: cli.style,
+    background: cli.background,
+    outputFormat: cli.outputFormat,
+    outputCompression: cli.outputCompression,
+    moderation: cli.moderation,
+    responseFormat: cli.responseFormat,
+    user: cli.user,
+    imageUrls: cli.imageUrls,
+  };
+
   let lastError = null;
   for (let index = 1; index <= MAX_RETRY_ATTEMPTS; index++) {
     attempt.try_count = index;
     try {
-      const submitted = await submitGeneration(candidateApiKey, candidate.baseUrl, cli.prompt, cli.size, finalResolution, cli.imageUrls, candidate.model.model, cli.quality, cli.style, cli.responseFormat, cli.user);
+      const submitted = await submitGeneration({
+        apiKey: candidateApiKey,
+        baseUrl: candidate.baseUrl,
+        family: candidate.family,
+        apiStyle: candidate.apiStyle,
+        params,
+      });
       attempt.response_mode = submitted.mode;
 
-      const image = submitted.mode === 'async'
-        ? await (attempt.task_id = submitted.taskId, process.stderr.write(`任务已提交: ${submitted.taskId}\n`), pollTask(candidateApiKey, candidate.baseUrl, submitted.taskId))
-        : (process.stderr.write('接口直接返回了图片结果\n'), submitted.image);
+      let images;
+      if (submitted.mode === 'async') {
+        attempt.task_id = submitted.taskId;
+        process.stderr.write(`任务已提交: ${submitted.taskId}\n`);
+        images = [await pollTask(candidateApiKey, candidate.baseUrl, submitted.taskId)];
+      } else {
+        process.stderr.write(`接口直接返回了 ${submitted.images.length} 张图片\n`);
+        images = submitted.images;
+      }
 
       const runDir = candidate.outputOverride
         ? null
         : buildRunDir(candidate.rootOutputDir || process.cwd(), attemptStartedAt);
-      const savedPath = await saveImage(image, candidate.outputOverride, runDir);
+      const savedPaths = [];
+      for (let imageIndex = 0; imageIndex < images.length; imageIndex++) {
+        const savedPath = await saveImage(images[imageIndex], candidate.outputOverride, runDir, imageIndex);
+        if (savedPath) savedPaths.push(savedPath);
+      }
+      const savedPath = savedPaths[0] || null;
 
       attempt.status = 'success';
       attempt.completed_at = new Date().toISOString();
       attempt.duration_ms = Date.now() - attemptStartedAt.getTime();
       attempt.saved_path = savedPath;
+      attempt.saved_paths = savedPaths;
       attempt.run_dir = runDir;
 
       writeRunMeta(runDir, {
         prompt: cli.prompt,
         profile: candidate.name,
         base_url: candidate.baseUrl,
+        family: candidate.family,
+        api_style: candidate.apiStyle,
         model: candidate.model.model,
         model_key: candidate.model.key,
-        size: cli.size,
-        resolution: finalResolution,
+        size: cli.size || null,
+        resolution: cli.resolution || null,
+        image_size: cli.imageSize || null,
+        n: cli.n || null,
         started_at: attemptStartedAt.toISOString(),
         completed_at: attempt.completed_at,
         saved_path: savedPath,
+        saved_paths: savedPaths,
         task_id: attempt.task_id || null,
         image_url_count: cli.imageUrls.length,
       });
 
       runRecord.attempts.push(attempt);
-      return { attempt, savedPath, runDir, image };
+      return { attempt, savedPath, savedPaths, runDir, images };
     } catch (error) {
       lastError = error;
       const classification = classifyError(error);
@@ -829,45 +915,50 @@ async function main() {
     attempts: [],
   };
 
-  let finalResolution = cli.resolution;
-  if (cli.resolution === '4k' && !VALID_4K_SIZES.has(cli.size)) {
-    process.stderr.write(`注意：4K 不支持 ${cli.size} 比例，自动降为 2K\n`);
-    finalResolution = '2k';
-  }
-
   for (let index = 0; index < runtime.candidates.length; index++) {
     const candidate = runtime.candidates[index];
 
     try {
-      const result = await runCandidate(candidate, cli, finalResolution, runRecord);
+      const result = await runCandidate(candidate, cli, runRecord);
       const completedAt = new Date();
       runRecord.status = 'success';
       runRecord.completed_at = completedAt.toISOString();
       runRecord.duration_ms = completedAt.getTime() - startedAt.getTime();
       runRecord.selected_profile = candidate.name;
+      runRecord.family = candidate.family;
+      runRecord.api_style = candidate.apiStyle;
       runRecord.model = candidate.model.model;
       runRecord.model_key = candidate.model.key;
       runRecord.model_source = candidate.model.source;
       runRecord.saved_path = result.savedPath || null;
+      runRecord.saved_paths = result.savedPaths || [];
       runRecord.run_dir = result.runDir || null;
       writeRunLog(runRecord);
 
-      if (result.savedPath) {
-        process.stderr.write(`图片已保存到本地: ${result.savedPath}\n`);
+      if (result.savedPaths?.length) {
+        result.savedPaths.forEach((savedPath) => {
+          process.stderr.write(`图片已保存到本地: ${savedPath}\n`);
+        });
         if (result.runDir) {
           process.stderr.write(`图片目录: ${result.runDir}\n`);
         }
-        console.log(result.savedPath);
+        // stdout 保持一行一个路径，方便调用方直接取
+        result.savedPaths.forEach((savedPath) => console.log(savedPath));
         return;
       }
 
-      if (result.image.imageUrl) {
-        console.log(result.image.imageUrl);
+      const firstImage = result.images?.[0];
+      if (firstImage?.imageUrl) {
+        console.log(firstImage.imageUrl);
         return;
       }
 
-      console.log(result.image.base64);
-      return;
+      if (firstImage?.base64) {
+        console.log(firstImage.base64);
+        return;
+      }
+
+      throw new Error('生成成功但没有任何可用的图片结果。');
     } catch (error) {
       const classification = classifyError(error);
       const shouldFallback = classification.fallback && index < runtime.candidates.length - 1;

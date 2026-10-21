@@ -299,8 +299,18 @@ node "$SKILL_DIR/scripts/generate.js" [options]
 - `--prompt`
   - 必填，图片提示词
 - `--model`
-  - 可选，本次使用的模型，接受短名或原始 model ID
-  - 不传则用配置文件里的当前模型，再退回默认 `image-2`
+  - 可选，本次使用的模型，接受短名、`family:短名` 或原始 model ID
+  - 不传则用 profile 固定的模型，再退回全局当前模型
+- `--family`
+  - 可选，`openai` / `gemini` / `grok`（别名 `banana`、`xai`、`image`）
+- `--api`
+  - 可选，`openai`（默认，OpenAI 兼容接口）/ `official`（官方接口）
+- `--n`
+  - 可选，一次生成多张（上限因接口而异）
+- `--image-size`
+  - 可选，Gemini 官方接口的 `image_size`（`512` / `1K` / `2K` / `4K`）
+- `--background` / `--output-format` / `--output-compression` / `--moderation`
+  - 可选，仅 OpenAI 官方接口支持
 - `--profile`
   - 可选，临时指定本次生成使用哪个 profile
 - `--size`
@@ -342,6 +352,13 @@ node "$SKILL_DIR/scripts/setup.js" [options]
   - 初始化或新增 profile 时，指定图片站点地址
 - `--api-key`
   - 初始化或新增 profile 时，写入 Keychain 的密钥
+- `--family`
+  - 初始化或新增 profile 时，指定模型族（`openai` / `gemini` / `grok`），默认 `openai`
+- `--api`
+  - 初始化或新增 profile 时，指定接口协议，默认 `openai`（OpenAI 兼容接口）
+- `--sync-models`
+  - 用该 profile 的 URL + Key 拉取模型列表，写进 `synced_models`
+  - 可单独运行（作用于当前 profile），也可与初始化命令一起用
 - `--activate`
   - 初始化后立即设为当前默认 profile
 - `--list`
@@ -476,15 +493,61 @@ node "$SKILL_DIR/scripts/setup.js" --uninstall-skill --keep-keychain
 node "$SKILL_DIR/scripts/setup.js" --uninstall-skill --purge-logs
 ```
 
+## 模型族与接口协议
+
+两个独立维度：
+
+| 维度 | 取值 | 作用 |
+|---|---|---|
+| `family` | `openai` / `gemini` / `grok` | 选哪家的模型 |
+| `api` | `openai`（默认）/ `official` | 走哪种协议 |
+
+**默认全部走 OpenAI 兼容接口**，Gemini 和 Grok 的模型也一样。这样中转站、聚合网关可以直接用同一套 `/images/generations`。
+
+| family | `api=openai`（默认） | `api=official` |
+|---|---|---|
+| openai | `/images/generations` | `/images/generations`（像素 size） |
+| gemini | `/images/generations` | `/interactions` |
+| grok | `/images/generations` | `/images/generations` + `aspect_ratio` |
+
+```bash
+# 默认：Gemini 模型也走 OpenAI 兼容接口
+node "$SKILL_DIR/scripts/generate.js" --family gemini --model banana-2.1 --prompt "..."
+
+# 显式切到 Gemini 官方接口
+node "$SKILL_DIR/scripts/generate.js" --family gemini --api official --prompt "..."
+```
+
+`family` 也可以用别名：`banana` / `nano-banana` → gemini，`xai` → grok，`image` / `gpt` → openai。
+
+### 用 URL + Key 拉取模型
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --sync-models [--profile "main"]
+```
+
+会用该 profile 的 `base_url` 和 Keychain 中的 Key 请求 `/models`，只保留该族能生图的模型，写进 `profile.synced_models` 并合并进模型目录。
+
 ## 模型选择
 
-内置 3 个模型：
+内置 3 个 OpenAI 模型：
 
 | 短名 | 实际发给接口的 model ID | 说明 |
 |---|---|---|
 | `image-2` | `gpt-image-2` | 默认模型 |
 | `image-2.5-sunburst` | `gpt-image-2.5-sunburst` | 2.5 系列 |
 | `image-2.5-flare` | `gpt-image-2.5-flare` | 2.5 系列 |
+
+其他模型族的内置模型（默认同样走 OpenAI 兼容接口）：
+
+| 族 | 短名 | model ID |
+|---|---|---|
+| gemini | `banana-2.1` | `gemini-nano-banana-2.1` |
+| gemini | `banana-2-lite` | `gemini-3.1-flash-lite-image` |
+| gemini | `banana-2` | `gemini-3.1-flash-image` |
+| gemini | `banana-pro` | `gemini-3-pro-image` |
+| gemini | `banana` | `gemini-2.5-flash-image` |
+| grok | `grok-imagine-2` | `grok-imagine-image-2.0` |
 
 ### 查看可选模型
 

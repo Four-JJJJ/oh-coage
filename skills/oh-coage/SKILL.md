@@ -1,18 +1,20 @@
 ---
 name: oh-coage
-description: 使用可配置站点的 GPT-Image 系列 API 生成图片，支持文生图和图生图，并可在 gpt-image-2 / gpt-image-2.5-sunburst / gpt-image-2.5-flare 三个内置模型间切换或自定义模型。当用户说"生图"、"画图"、"生成图片"、"oh-coage"、"gpt-image"、"Image2 生图"、"帮我画"、"用 gpt 画"、"用 2.5 画"、"切换模型"、"换模型"、"换个模型"、"改成 xxx 模型"、"使用 xxx 模型"、"有哪些模型"、"把这张图改成"、"参考这张图"等涉及 AI 图片生成、图片编辑或模型切换的请求时触发此技能。首次使用时先做本地初始化：收集图片总保存目录、profile 名、站点 URL 和 API Key；支持聊天问答和可视化表单两种初始化方式；Key 写入本机 Keychain，本地配置文件只保存非敏感信息。
+description: 使用可配置站点或官方接口生成图片，支持 OpenAI 兼容、Gemini（Nano Banana）与 Grok Imagine 三类模型，默认全部走 OpenAI 兼容生图接口，也可按用户要求切换到 Gemini / Grok 官方接口。支持文生图、图生图、模型切换、按 URL + Key 拉取可用模型、多 profile 保存与 fallback。当用户说"生图"、"画图"、"生成图片"、"oh-coage"、"gpt-image"、"Image2 生图"、"帮我画"、"用 gpt 画"、"用 2.5 画"、"用 banana 画"、"用 grok 画"、"切换模型"、"换模型"、"换个模型"、"改成 xxx 模型"、"使用 xxx 模型"、"有哪些模型"、"拉取模型"、"用官方接口"、"把这张图改成"、"参考这张图"等涉及 AI 图片生成、图片编辑、模型或接口切换的请求时触发此技能。首次使用时先做本地初始化：收集图片总保存目录、profile 名、站点 URL 和 API Key；支持聊天问答和可视化表单两种初始化方式；Key 写入本机 Keychain，本地配置文件只保存非敏感信息。
 ---
 
-# GPT-Image 图片生成
+# 图片生成
 
-通过可配置站点的 GPT-Image 系列 API 生成图片。默认模型 `gpt-image-2`，另有 2 个 2.5 系列模型可选，也支持用户自定义模型。支持：
+通过可配置站点或官方接口生成图片。默认模型 `gpt-image-2`，另有 2 个 2.5 系列模型；同时支持 Gemini（Nano Banana）和 Grok Imagine 模型。支持：
 
 - 文生图和图生图
-- 模型选择：3 个内置 + 自定义
+- 三类模型族：`openai`（image）/ `gemini`（banana）/ `grok`
+- 两种接口协议：默认 `openai` 兼容接口，可选 `official` 官方接口
+- 用站点 URL + Key 拉取该站点真实支持的模型
 - 同步返回和异步任务轮询
 - 默认保存到用户指定目录
 - 多 profile 管理与切换
-- 自动 fallback 到备用 profile
+- 自动 fallback 到同一模型族内的备用 profile
 - 运行日志记录
 - API Key 写入本机 Keychain，不写入仓库或普通文本
 
@@ -26,6 +28,8 @@ description: 使用可配置站点的 GPT-Image 系列 API 生成图片，支持
 ├── scripts/
 │   ├── config-store.js
 │   ├── generate.js
+│   ├── models.js
+│   ├── providers.js
 │   ├── resolve-output-dir.js
 │   └── setup.js
 └── assets/
@@ -34,9 +38,31 @@ description: 使用可配置站点的 GPT-Image 系列 API 生成图片，支持
 
 本文所有命令里的 `$SKILL_DIR` 都指这个目录。如果宿主把 `$SKILL_DIR` 设成了别的值，请改用**本 `SKILL.md` 实际所在目录**。
 
+## 模型族与接口协议
+
+这里有两个独立维度，别混：
+
+- **模型族（family）**：`openai` / `gemini` / `grok`，决定模型 ID 和默认站点
+- **接口协议（api）**：`openai`（默认，OpenAI 兼容 `/images/generations`）/ `official`（各家官方接口）
+
+**默认全部走 OpenAI 兼容接口**，包括 Gemini 和 Grok 的模型。也就是说：
+
+- `family=gemini` + `api=openai` → 把 `gemini-*` 模型发给 `/images/generations`
+- `family=grok` + `api=openai` → 把 `grok-imagine-image-*` 发给 `/images/generations`
+
+这样聚合网关和中转站可以直接用同一套请求形状。
+
+只有用户明确要求「用官方接口」「用 Gemini 原生接口」「走 xAI 官方」时，才切到 `api=official`：
+
+| family | `api=openai`（默认） | `api=official` |
+|---|---|---|
+| openai | `/images/generations`，`size` 用比例 | `/images/generations`，`size` 用 `1024x1024` 这类像素值 |
+| gemini | `/images/generations` | `/interactions`，`x-goog-api-key` |
+| grok | `/images/generations` | `/images/generations` + `aspect_ratio` |
+
 ## 模型选择
 
-内置 3 个模型：
+内置 3 个 OpenAI 模型：
 
 | 短名 | model ID |
 |---|---|
@@ -50,6 +76,51 @@ description: 使用可配置站点的 GPT-Image 系列 API 生成图片，支持
 2. **单次覆盖用 `--model`**，不改动持久配置。
 3. **`2.5` / `image-2.5` / `gpt-image-2.5` 是歧义输入。** 脚本会直接报错并列出两个候选。用户只说「用 2.5 画」时，你要先问清是 `sunburst` 还是 `flare`，**不要替用户猜**——两者是不同档位，猜错会白花一次配额。
 4. **也可以直接传原始 model ID**，例如 `--model gpt-image-2.5-flare`。
+
+### Gemini 与 Grok 模型
+
+其他模型族的内置模型：
+
+| 族 | 短名 | model ID |
+|---|---|---|
+| gemini | `banana-2.1` | `gemini-nano-banana-2.1` |
+| gemini | `banana-2-lite` | `gemini-3.1-flash-lite-image` |
+| gemini | `banana-2` | `gemini-3.1-flash-image` |
+| gemini | `banana-pro` | `gemini-3-pro-image` |
+| gemini | `banana` | `gemini-2.5-flash-image` |
+| grok | `grok-imagine-2` | `grok-imagine-image-2.0` |
+
+这些模型**默认也走 OpenAI 兼容接口**。用 `--family` 选族：
+
+```bash
+node "$SKILL_DIR/scripts/generate.js" --family gemini --model banana-2.1 --prompt "..."
+node "$SKILL_DIR/scripts/generate.js" --family grok --model grok-imagine-2 --prompt "..."
+```
+
+模型名也支持 `族:短名` 写法，例如 `--model gemini:banana-2.1`。
+
+### 拉取站点真实支持的模型
+
+模型列表因站点而异，用该 profile 自己的 URL 和 Keychain 里的 Key 拉一次：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --sync-models [--profile "main"]
+```
+
+结果会写进 `profile.synced_models` 并合并进模型目录，之后就能直接 `--model <拉到的ID>` 使用。
+拉取只保留该模型族的生图模型；若一个都没识别到，会报错并提示用 `--add-model` 手动指定。
+
+### 用户要切换接口协议时
+
+- 「用官方接口 / 原生接口」→ `--api official`（本次）或初始化时 `--api official`（持久）
+- 「还是走 OpenAI 兼容」→ `--api openai`
+- 不点名时**保持默认 `openai`**，不要主动改成官方接口
+
+```bash
+node "$SKILL_DIR/scripts/generate.js" --family gemini --api official --prompt "..."
+```
+
+官方接口只发该家支持的字段。不支持会直接报错，不会静默透传。
 
 查看可用模型与当前模型：
 
@@ -421,18 +492,24 @@ node "$SKILL_DIR/scripts/generate.js" \
 
 ## 参数选择
 
-- `size` 默认 `1:1`
-- 宽屏图优先 `16:9`
-- 竖屏或手机壁纸优先 `9:16`
-- 海报优先 `2:3`
-- `resolution` 默认 `2k`
-- 用户说高清或 4K 时优先 `4k`
-- 用户说快速或省钱时优先 `1k`
-- `model` 不传就用当前模型；用户点名某个模型时才传 `--model`
+### 默认（OpenAI 兼容接口）
 
-默认模型是 `gpt-image-2`。用户没有提模型时，不要主动换成 2.5 系列——2.5 是不同档位，可能更贵。只有用户明确要求时才切换或指定。
+- `size` 默认 `1:1`，宽屏优先 `16:9`，竖屏/壁纸优先 `9:16`，海报优先 `2:3`
+- `resolution` 默认 `2k`；用户说高清或 4K 时优先 `4k`，说快速/省钱时优先 `1k`
+- `n` 可选，生成多张（各接口上限不同，Grok 官方接口为 1–10）
+- `quality` / `style` / `response_format` / `user` 会原样透传，兼容不同中转站
 
-4K 仅支持：`16:9`、`9:16`、`2:1`、`1:2`、`21:9`、`9:21`。不兼容时脚本会自动降为 `2k`。
+默认模型是 `gpt-image-2`。用户没有提模型时，不要主动换成 2.5 系列——2.5 是不同档位，可能更贵。
+
+### 官方接口专属参数
+
+切到 `--api official` 后，字段会按家映射：
+
+- **OpenAI 官方**：`--quality low|medium|high|auto`、`--background`、`--output-format png|jpeg|webp`、`--output-compression 0-100`、`--moderation`；`--size` 接受 `1:1` / `2:3` / `3:2` 并换成像素值
+- **Gemini 官方**：`--size` 作 `aspect_ratio`，`--image-size 512|1K|2K|4K`；不支持 `quality` / `style` / `response_format`
+- **Grok 官方**：`--size` 作 `aspect_ratio`，`--resolution 1k|2k`，`--quality low|medium|auto`，`--response-format url|b64_json`；不支持 `background` / `output_format` / `style`
+
+传了该家不支持的字段会报错，这时要么去掉，要么换接口协议。
 
 ## 输出
 

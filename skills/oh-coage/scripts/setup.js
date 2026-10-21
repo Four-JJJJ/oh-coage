@@ -34,6 +34,14 @@ const {
   isBuiltinModelKey,
   normalizeModelInput,
 } = require('./models');
+const {
+  FAMILIES,
+  normalizeFamily,
+  normalizeApiStyle,
+  defaultBaseUrl,
+  modelEntriesFromList,
+  buildModelListRequest,
+} = require('./providers');
 
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -51,6 +59,9 @@ function parseArgs() {
         break;
       }
       case '--profile': parsed.profile = args[++i]; break;
+      case '--family': parsed.family = args[++i]; break;
+      case '--api': parsed.apiStyle = args[++i]; break;
+      case '--sync-models': parsed.syncModels = true; break;
       case '--base-url': parsed.baseUrl = args[++i]; break;
       case '--api-key': parsed.apiKey = args[++i]; break;
       case '--activate': parsed.activate = true; break;
@@ -89,7 +100,9 @@ function parseArgs() {
 function printUsage() {
   console.error('用法:');
   console.error('  初始化或新增 profile:');
-  console.error('    node setup.js --output-dir "/path/to/images" --profile "main" --base-url "https://example.com/v1" --api-key "KEY" [--activate] [--model "image-2"]');
+  console.error('    node setup.js --output-dir "/path/to/images" --profile "main" --base-url "https://example.com/v1" --api-key "KEY" [--activate] [--family openai|gemini|grok] [--api openai|official] [--model "image-2"]');
+  console.error('  拉取该 profile 支持的模型（用它的 URL + Key）:');
+  console.error('    node setup.js --sync-models [--profile "main"]');
   console.error('  列出 profile:');
   console.error('    node setup.js --list');
   console.error('  切换当前 profile:');
@@ -124,6 +137,29 @@ function requireConfig() {
   return context;
 }
 
+function profileFamily(profile) {
+  try {
+    return normalizeFamily(profile?.family || 'openai');
+  } catch {
+    return 'openai';
+  }
+}
+
+function profileApiStyle(profile, family) {
+  try {
+    return normalizeApiStyle(profile?.api_style, family || profileFamily(profile));
+  } catch {
+    return 'openai';
+  }
+}
+
+function describeProfile(profile) {
+  const family = profileFamily(profile);
+  const apiStyle = profileApiStyle(profile, family);
+  const apiLabel = apiStyle === 'official' ? '官方接口' : 'OpenAI 兼容接口';
+  return `${family} / ${apiLabel}`;
+}
+
 function listProfiles() {
   const { config, configPath } = loadActiveConfig();
   if (!config) {
@@ -136,8 +172,99 @@ function listProfiles() {
   Object.entries(config.profiles || {}).forEach(([name, profile]) => {
     const flag = name === config.active_profile ? '*' : ' ';
     const modelNote = profile.model ? ` [model: ${profile.model}]` : '';
-    console.log(`${flag} ${name} -> ${profile.base_url} -> ${profile.root_output_dir || profile.output_dir}${modelNote}`);
+    const syncedNote = Array.isArray(profile.synced_models) && profile.synced_models.length
+      ? ` [synced: ${profile.synced_models.length}]`
+      : '';
+    console.log(`${flag} ${name} (${describeProfile(profile)}) -> ${profile.base_url} -> ${profile.root_output_dir || profile.output_dir}${modelNote}${syncedNote}`);
   });
+}
+
+function fetchJson(url, headers, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      reject(new Error(`模型列表地址不合法: ${url}`));
+      return;
+    }
+
+    const mod = parsed.protocol === 'https:' ? https : http;
+    const req = mod.request(url, { method: 'GET', headers }, (res) => {
+      const chunks = [];
+      res.on('error', reject);
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf-8');
+        if (res.statusCode >= 400) {
+          reject(new Error(`HTTP ${res.statusCode}: ${raw.slice(0, 200)}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(raw));
+        } catch {
+          reject(new Error('模型列表返回的不是 JSON'));
+        }
+      });
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`Request timed out after ${timeoutMs}ms`)));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+/** 用该 profile 自己的 URL 和 Key 拉取模型列表，并只缓存该模型族的生图模型。 */
+async function syncProfileModels(profileName) {
+  const { config, configPath } = requireConfig();
+  const targetName = profileName || config.active_profile;
+  const profile = config.profiles?.[targetName];
+
+  if (!profile) {
+    throw new Error(`profile 不存在: ${targetName}`);
+  }
+
+  const family = profileFamily(profile);
+  const apiStyle = profileApiStyle(profile, family);
+  const baseUrl = normalizeBaseUrl(profile.base_url);
+  assertValidBaseUrl(baseUrl);
+
+  const apiKey = readKeychainSecret(profile.keychain_account);
+  const spec = buildModelListRequest({ family, apiStyle, baseUrl, apiKey });
+  const payload = await fetchJson(spec.url, spec.headers);
+  const discovered = modelEntriesFromList(family, payload);
+
+  if (discovered.length === 0) {
+    const total = (payload?.data || payload?.models || []).length;
+    throw new Error(
+      `模型列表里没有识别到 ${family} 的生图模型（共返回 ${total} 个）。`
+      + '如果该站点用了自定义命名，请用 setup.js --add-model 手动指定 model ID。',
+    );
+  }
+
+  const syncedAt = new Date().toISOString();
+  profile.synced_models = discovered.map((entry) => entry.model);
+  profile.models_synced_at = syncedAt;
+  profile.updated_at = syncedAt;
+  config.updated_at = syncedAt;
+
+  // 拉取结果按 family 标记进全局目录，避免不同站点互相覆盖
+  config.discovered_models ||= {};
+  for (const entry of discovered) {
+    config.discovered_models[entry.model] = {
+      model: entry.model,
+      family,
+      source_profile: targetName,
+      updated_at: syncedAt,
+    };
+  }
+
+  saveConfig(configPath, config);
+
+  console.log(`已从 ${baseUrl} 拉取 ${family} 模型：${discovered.length} 个`);
+  discovered.forEach((entry) => console.log(`  ${entry.model}`));
+  console.log(`已写入 profile ${targetName} 的 synced_models，并合并进模型目录。`);
+
+  return discovered;
 }
 
 function probeUrl(url, timeoutMs = 8000) {
@@ -215,8 +342,8 @@ async function healthCheck(options) {
 
     try {
       const profileModel = profile.model
-        ? resolveModel(profile.model, config.custom_models)
-        : resolveConfiguredModel(config);
+        ? resolveModel(profile.model, config, profileFamily(profile))
+        : resolveConfiguredModel(config, profileFamily(profile));
       checks.push({
         item: 'model',
         ok: true,
@@ -225,6 +352,8 @@ async function healthCheck(options) {
     } catch (error) {
       checks.push({ item: 'model', ok: false, detail: error.message.split('\n')[0] });
     }
+
+    checks.push({ item: 'interface', ok: true, detail: describeProfile(profile) });
 
     const healthy = checks.every((check) => check.ok);
     const activeFlag = name === config.active_profile ? '*' : ' ';
@@ -256,22 +385,39 @@ function listModels() {
     const flag = entry.key === current.key ? '*' : ' ';
     console.log(`${flag} ${entry.key} -> ${entry.model}${entry.builtin ? '' : '（自定义）'}`);
   });
+
+  // 其他模型族的内置模型单独列，避免撑坏默认目录的旧输出
+  const otherFamilies = Object.fromEntries(
+    FAMILIES.filter((family) => family !== 'openai').map((family) => [family, buildModelCatalog(config, family)]),
+  );
+  for (const [family, entries] of Object.entries(otherFamilies)) {
+    if (!entries.length) continue;
+    console.log(`\n${family}（需用 --family ${family} 或对应的 profile）:`);
+    entries.forEach((entry) => console.log(`  ${entry.key} -> ${entry.model}${entry.builtin ? '' : '（自定义）'}`));
+  }
 }
 
-function switchModel(modelInput) {
+function switchModel(modelInput, family) {
   if (!modelInput) {
     printUsage();
     process.exit(1);
   }
 
   const { config, configPath } = requireConfig();
-  const resolved = resolveModel(modelInput, config.custom_models);
+
+  // 没显式给 --family 时，按当前活跃 profile 的族解析，
+  // 否则 banana-* / grok-* 这类短名永远找不到。
+  const activeProfile = config.profiles?.[config.active_profile];
+  const resolvedFamily = family
+    ? normalizeFamily(family)
+    : (activeProfile ? profileFamily(activeProfile) : null);
+  const resolved = resolveModel(modelInput, config, resolvedFamily);
 
   config.current_model = resolved.key;
   config.updated_at = new Date().toISOString();
   saveConfig(configPath, config);
 
-  console.log(`已切换当前模型: ${resolved.key} -> ${resolved.model}`);
+  console.log(`已切换当前模型: ${resolved.key} -> ${resolved.model}（${resolved.family}）`);
   console.log('后续生成都会使用这个模型，直到你再次切换。');
 }
 
@@ -297,15 +443,23 @@ function addCustomModel(options) {
   config.custom_models ||= {};
   const existed = Boolean(config.custom_models[key]);
 
+  let customFamily = 'openai';
+  try {
+    customFamily = normalizeFamily(options.family || 'openai');
+  } catch {
+    customFamily = 'openai';
+  }
+
   config.custom_models[key] = {
     model: options.modelId,
+    family: customFamily,
     ...(options.label ? { label: options.label } : {}),
     updated_at: new Date().toISOString(),
   };
   config.updated_at = new Date().toISOString();
   saveConfig(configPath, config);
 
-  console.log(`已${existed ? '更新' : '添加'}自定义模型: ${key} -> ${options.modelId}`);
+  console.log(`已${existed ? '更新' : '添加'}自定义模型: ${key} -> ${options.modelId}（${customFamily}）`);
   console.log(`切换到这个模型：node setup.js --model "${key}"`);
 }
 
@@ -360,7 +514,7 @@ function setProfileModel(options) {
     return;
   }
 
-  const resolved = resolveModel(options.profileModel, config.custom_models);
+  const resolved = resolveModel(options.profileModel, config, profileFamily(profile));
   profile.model = resolved.key;
   saveConfig(configPath, config);
 
@@ -381,6 +535,10 @@ function upsertProfile(options) {
     printUsage();
     process.exit(1);
   }
+
+  // 默认全部走 OpenAI 兼容接口，官方接口必须显式指定
+  const family = options.family ? normalizeFamily(options.family) : 'openai';
+  const apiStyle = options.apiStyle ? normalizeApiStyle(options.apiStyle, family) : 'openai';
 
   // 存进去之前就拦住非法 base_url，别等到生成时才发现
   const normalizedBaseUrl = normalizeBaseUrl(options.baseUrl);
@@ -405,7 +563,11 @@ function upsertProfile(options) {
   const keychainAccount = config.profiles[options.profile]?.keychain_account || buildKeychainAccount(options.profile, configPath);
   saveKeychainSecret(keychainAccount, options.apiKey);
 
+  const previous = config.profiles[options.profile] || {};
   config.profiles[options.profile] = {
+    ...previous,
+    family,
+    api_style: apiStyle,
     base_url: normalizedBaseUrl,
     root_output_dir: options.outputDir,
     keychain_account: keychainAccount,
@@ -414,7 +576,7 @@ function upsertProfile(options) {
 
   // 初始化时可以直接给这个 profile 固定模型
   if (options.profileModel && !isClearModelInput(options.profileModel)) {
-    config.profiles[options.profile].model = resolveModel(options.profileModel, config.custom_models).key;
+    config.profiles[options.profile].model = resolveModel(options.profileModel, config, family).key;
   }
 
   if (options.activate || !config.active_profile) {
@@ -427,6 +589,7 @@ function upsertProfile(options) {
 
   console.log(`配置已保存: ${configPath}`);
   console.log(`profile: ${options.profile}`);
+  console.log(`interface: ${describeProfile(config.profiles[options.profile])}`);
   console.log(`base_url: ${config.profiles[options.profile].base_url}`);
   console.log(`root_output_dir: ${config.profiles[options.profile].root_output_dir}`);
   console.log(`active_profile: ${config.active_profile}`);
@@ -562,7 +725,7 @@ function main() {
   if (options.addModel) {
     addCustomModel(options);
     if (options.model) {
-      switchModel(options.model);
+      switchModel(options.model, options.family);
     }
     return;
   }
@@ -601,10 +764,14 @@ function main() {
     return healthCheck(options);
   }
 
+  if (options.syncModels) {
+    return syncProfileModels(options.profile);
+  }
+
   if (!isInitRequest(options)) {
     // 只有 --model 单独出现时才是「切换全局当前模型」
     if (options.model) {
-      switchModel(options.model);
+      switchModel(options.model, options.family);
       return;
     }
 
@@ -616,7 +783,10 @@ function main() {
   // 以前 --model 会直接 return，把整个初始化静默吞掉。
   upsertProfile(options);
   if (options.model) {
-    switchModel(options.model);
+    switchModel(options.model, options.family);
+  }
+  if (options.syncModels) {
+    return syncProfileModels(options.profile);
   }
 }
 
