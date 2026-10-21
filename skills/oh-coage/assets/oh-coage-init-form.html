@@ -62,7 +62,7 @@
     <div class="init-fields">
       <label class="form-label init-field">
         图片保存目录
-        <input class="form-control" name="outputDir" type="text" placeholder="自动使用当前项目目录或桌面" autocomplete="off" required>
+        <input class="form-control" name="outputDir" type="text" placeholder="可不填，自动使用当前项目目录或桌面" autocomplete="off">
         <span id="oh-coage-output-dir-hint" class="init-path-meta text-small text-muted"></span>
       </label>
 
@@ -142,8 +142,8 @@
   useProjectDir.checked = hasProject;
   useProjectDir.disabled = !hasProject;
   outputDirHint.textContent = hasProject
-    ? '已检测到当前项目，默认保存在项目文件夹内；也可以直接修改路径。'
-    : '当前没有项目，默认使用桌面；也可以直接输入其他路径。';
+    ? '可不填，默认保存在项目文件夹内；也可以直接修改路径。'
+    : '可不填，默认保存在桌面；也可以直接输入其他路径。';
 
   submitButton.addEventListener('click', async () => {
     if (!form.reportValidity()) return;

@@ -1,6 +1,6 @@
 ---
 name: oh-coage
-description: 使用可配置站点或官方接口生成图片，支持 OpenAI 兼容、Gemini（Nano Banana）与 Grok Imagine 三类模型，默认全部走 OpenAI 兼容生图接口，也可按用户要求切换到 Gemini / Grok 官方接口。支持文生图、图生图、模型切换、按 URL + Key 拉取可用模型、多 profile 保存与 fallback。当用户说"生图"、"画图"、"生成图片"、"oh-coage"、"gpt-image"、"Image2 生图"、"帮我画"、"用 gpt 画"、"用 2.5 画"、"用 banana 画"、"用 grok 画"、"切换模型"、"换模型"、"换个模型"、"改成 xxx 模型"、"使用 xxx 模型"、"有哪些模型"、"拉取模型"、"用官方接口"、"把这张图改成"、"参考这张图"等涉及 AI 图片生成、图片编辑、模型或接口切换的请求时触发此技能。首次使用时先做本地初始化：收集图片总保存目录、profile 名、站点 URL 和 API Key；支持聊天问答和可视化表单两种初始化方式；Key 写入本机 Keychain，本地配置文件只保存非敏感信息。
+description: 使用可配置站点或官方接口生成图片，支持 OpenAI 兼容、Gemini（Nano Banana）与 Grok Imagine 三类模型，默认全部走 OpenAI 兼容生图接口，也可按用户要求切换到 Gemini / Grok 官方接口。支持文生图、图生图、模型切换、按 URL + Key 拉取可用模型、多 profile 保存与 fallback。当用户说"生图"、"画图"、"生成图片"、"oh-coage"、"gpt-image"、"Image2 生图"、"帮我画"、"用 gpt 画"、"用 2.5 画"、"用 banana 画"、"用 grok 画"、"切换模型"、"换模型"、"换个模型"、"改成 xxx 模型"、"使用 xxx 模型"、"有哪些模型"、"拉取模型"、"用官方接口"、"把这张图改成"、"参考这张图"等涉及 AI 图片生成、图片编辑、模型或接口切换的请求时触发此技能。生成结果应直接在对话中展示图片，兼容接口返回 URL 与 base64 两种情况。首次使用时先做本地初始化：收集 profile 名、站点 URL 和 API Key（图片目录非必填，自动落到项目目录或桌面）；支持聊天问答和可视化表单两种初始化方式；Key 写入本机 Keychain，本地配置文件只保存非敏感信息。
 ---
 
 # 图片生成
@@ -219,7 +219,7 @@ node "$SKILL_DIR/scripts/setup.js" --profile-model "image-2.5-flare" --profile "
 2. 如果**没有初始化**，第一条用户可见回复必须直接进入初始化流程，不要先做别的探索
 3. 初始化方式按环境能力二选一，**先判定能力，再选路径**，不要"先试表单、失败了再回退"：
    - **增强路径**：仅当环境同时支持 inline HTML 渲染（`visualize` 类能力）**且**存在 `window.openai.sendFollowUpMessage` 时，才渲染表单
-   - **默认路径**：以上任一条件不满足时，直接用文字询问那 4 个值
+   - **默认路径**：以上任一条件不满足时，直接用文字询问那 3 个值
 4. 在未完成初始化前：
    - 不要先去检查其他生图技能
    - 不要先去寻找其他图像生成路径
@@ -281,7 +281,7 @@ node "$SKILL_DIR/scripts/setup.js" --profile-model "image-2.5-flare" --profile "
 
 这是所有环境都必须可用的基线。第一条回复应尽量接近下面这个形式：
 
-`当前会先初始化 oh-coage。我需要你提供 4 个值：1. 图片总保存目录 2. profile 名称 3. 站点 URL 4. API Key。`
+`当前会先初始化 oh-coage。我需要你提供 3 个值：1. profile 名称 2. 站点 URL 3. API Key。图片会自动存到项目目录或桌面，不需要你选文件夹。`
 
 不要在这条回复里插入额外的工具探索、替代方案说明或别的链路检查。
 
@@ -290,14 +290,14 @@ node "$SKILL_DIR/scripts/setup.js" --profile-model "image-2.5-flare" --profile "
 只有在当前环境确实支持 inline HTML 渲染且存在 `window.openai.sendFollowUpMessage` 时才走这条路径。不要把它当作默认路径：在普通 CLI / 终端类 agent 里它不可用，强行渲染只会浪费一轮。
 
 1. 运行 `node "$SKILL_DIR/scripts/resolve-output-dir.js"` 得到默认保存目录
-2. 使用 `assets/oh-coage-init-form.html`，按宿主的 inline HTML 流程渲染，并把 `outputDir` 预填为上一步的结果
+2. 使用 `assets/oh-coage-init-form.html`，按宿主的 inline HTML 流程渲染，并把 `outputDir` 预填为上一步的结果（该字段非必填，用户可清空）
 3. 如果解析结果是项目根目录，把表单根节点的 `data-has-project` 设为 `true`；否则保持 `false`，并把保存目录预填为桌面
 4. 第一条回复只引导用户填表并展示表单，不要先用文字逐项询问，也不要把任何字段预填成真实密钥
 
 表单提交后会发来一条包含 `OH_COAGE_INIT_FORM_SUBMISSION` 标记的结构化消息。收到这条消息后：
 
-1. 直接解析其中的 `outputDir`、`profile`、`baseUrl`、`apiKey`、`model`
-2. 用 `$SKILL_DIR/scripts/setup.js` 完成本地初始化，加上 `--activate`，并把 `model` 通过 `--model` 一起传入（`setup.js` 支持初始化和 `--model` 同时给，会先初始化再切换全局模型）
+1. 直接解析其中的 `outputDir`、`profile`、`baseUrl`、`apiKey`、`family`、`api`、`model`
+2. 用 `$SKILL_DIR/scripts/setup.js` 完成本地初始化，加上 `--activate`，把 `family` 通过 `--family`、`api` 通过 `--api` 一起传入，并把 `model` 通过 `--model` 一起传入（`setup.js` 支持初始化和 `--model` 同时给，会先初始化再切换全局模型）。`outputDir` 为空时**不要传** `--output-dir`，让脚本自动推导
 3. 不要在命令输出、日志、回复或截图中复述 `apiKey`
 4. 初始化后运行一次 `--health-check`，再报告 profile、模型、保存目录和检查结果
 
@@ -321,18 +321,18 @@ node "$SKILL_DIR/scripts/setup.js" --profile-model "image-2.5-flare" --profile "
 
 ## 首次使用初始化
 
-如果用户第一次使用，或者脚本提示“尚未完成 oh-coage 初始化”，先按上面的方式判定初始化路径，不要直接生成图片。无论走哪条路径，最终都需要这 4 个值：
+如果用户第一次使用，或者脚本提示“尚未完成 oh-coage 初始化”，先按上面的方式判定初始化路径，不要直接生成图片。无论走哪条路径，最终都需要这 3 个值：
 
-1. 图片总保存到哪个文件夹
-2. profile 名称是什么
-3. 站点 URL 是什么
-4. API Key 是什么
+1. profile 名称是什么
+2. 站点 URL 是什么
+3. API Key 是什么
+
+**图片保存目录不是必填项。** 不要主动追问文件夹；用户没提就省略 `--output-dir`，脚本会自动落到项目根目录（有项目时）或桌面。只在用户明确说“存到某个目录”时才传。
 
 然后运行：
 
 ```bash
 node "$SKILL_DIR/scripts/setup.js" \
-  --output-dir "/absolute/path/to/save" \
   --profile "default" \
   --base-url "https://your-image-site.example/v1" \
   --api-key "YOUR_KEY" \
@@ -341,7 +341,7 @@ node "$SKILL_DIR/scripts/setup.js" \
 
 初始化行为：
 
-- 在用户指定目录中创建 `oh-coage-config.json`
+- 在输出目录（用户指定或自动推导）中创建 `oh-coage-config.json`
 - 在 `~/.oh-coage/state.json` 里记录当前配置文件路径
 - 在 `~/.oh-coage/runs.jsonl` 中持续记录每次运行结果
 - 把 API Key 写入本机 Keychain，service 为 `oh-coage`
@@ -511,8 +511,48 @@ node "$SKILL_DIR/scripts/generate.js" \
 
 传了该家不支持的字段会报错，这时要么去掉，要么换接口协议。
 
-## 输出
+## 输出与展示
 
-- 默认输出：本地图片文件路径
-- 如果用户显式传了 `--output`，保存到指定文件
-- 如果用户不想落地到本地，可自行传空的输出覆盖逻辑并只取 URL，但默认策略应优先保存本地，便于用户直接查看成果
+生图完成后，**直接在对话里把图片展示出来**，不要只回一句“已保存到 xxx”。
+
+### 先拿到结构化结果
+
+用 `--json` 跑生成，stdout 是一份可直接解析的 JSON：
+
+```json
+{
+  "status": "success",
+  "family": "gemini",
+  "api": "openai",
+  "model": "gemini-nano-banana-2.1",
+  "run_dir": "/path/to/20261021-153012",
+  "images": [
+    { "source": "url", "url": "https://...", "path": "/path/to/a.png", "display": "https://..." }
+  ]
+}
+```
+
+### URL 和 base64 都要兼容
+
+接口可能返回远程 URL，也可能返回 base64。脚本已经把两种都处理成可展示的形式，你只需要看 `display` 字段：
+
+| `source` | 含义 | 怎么展示 |
+|---|---|---|
+| `url` | 接口直接给了图床地址 | 用 `display`（即远程 URL）直接渲染；`path` 是同时落盘的副本 |
+| `base64` | 接口只给了图片数据 | base64 无法直接当图片地址用，必须用 `display`（即本地文件路径）渲染 |
+
+两种情况下 `display` 都已经填好，**不要自己拼 data URI 或重新编码**。
+
+### 展示方式
+
+1. 宿主有图片/媒体渲染能力（`visualize`、图片组件、附件等）→ 用它渲染 `display`
+2. 没有专用能力 → 用 Markdown 图片语法：`![生成的图片](display)`
+3. 本地路径渲染不出来时，把绝对路径也一并告诉用户，让他自己打开
+
+多张图时逐张展示，不要只给第一张。
+
+### 文件落盘
+
+- 默认会落盘：`<总目录>/<时间戳>/oh-coage-<序号>.png`
+- 用户显式传 `--output` 时保存到指定文件（多图时自动追加 `-2`、`-3`）
+- 落盘是默认策略：base64 不落盘就没法展示，URL 落盘则避免图床过期后找不到

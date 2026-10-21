@@ -460,6 +460,130 @@ test('setup --model resolves family short names against the active profile famil
   assert.equal(saved.current_model, 'banana-pro');
 });
 
+test('setup works without --output-dir and derives a default directory', async (t) => {
+  const home = createTempDir();
+  const stub = createSecurityStub(t);
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const result = await runNode(setupPath, [
+    '--profile', 'main',
+    '--base-url', 'https://example.com/v1',
+    '--api-key', 'k',
+    '--activate',
+  ], home, stub.env);
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /已自动推导/);
+
+  const statePath = path.join(home, '.oh-coage', 'state.json');
+  assert.ok(fs.existsSync(statePath), '应写入 state.json');
+
+  const configPath = JSON.parse(fs.readFileSync(statePath, 'utf8')).config_path;
+  const saved = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  assert.ok(saved.profiles.main.root_output_dir, '应自动推导出输出目录');
+  assert.equal(path.isAbsolute(saved.profiles.main.root_output_dir), true);
+});
+
+test('--json reports a displayable reference for url and base64 responses', async (t) => {
+  const home = createTempDir();
+  const outputDir = createTempDir();
+  const stub = createSecurityStub(t);
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(outputDir, { recursive: true, force: true }));
+
+  const imageServer = await startServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/v1/images/generations') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ b64_json: PNG_BASE64 }] }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  t.after(imageServer.close);
+
+  writeConfig(home, {
+    version: 1,
+    active_profile: 'main',
+    current_model: 'image-2',
+    profiles: {
+      main: {
+        base_url: imageServer.baseUrl,
+        root_output_dir: outputDir,
+        keychain_account: 'main:x',
+      },
+    },
+  }, outputDir);
+
+  const result = await runNode(generatePath, [
+    '--prompt', 'x',
+    '--out-dir', outputDir,
+    '--json',
+    '--no-fallback',
+  ], home, stub.env);
+
+  assert.equal(result.code, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.status, 'success');
+  assert.equal(payload.images.length, 1);
+  assert.equal(payload.images[0].source, 'base64');
+  assert.ok(payload.images[0].path, 'base64 必须落盘');
+  assert.equal(payload.images[0].display, payload.images[0].path, 'base64 用本地路径展示');
+  assert.ok(fs.existsSync(payload.images[0].path));
+});
+
+test('--json keeps the remote url for url responses', async (t) => {
+  const home = createTempDir();
+  const outputDir = createTempDir();
+  const stub = createSecurityStub(t);
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(outputDir, { recursive: true, force: true }));
+
+  let imageServerUrl = null;
+  const imageServer = await startServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/v1/images/generations') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ url: `${imageServerUrl}/files/out.png` }] }));
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/files/out.png') {
+      res.writeHead(200, { 'content-type': 'image/png' });
+      res.end(Buffer.from(PNG_BASE64, 'base64'));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  t.after(imageServer.close);
+  imageServerUrl = imageServer.baseUrl.replace(/\/v1$/, '');
+
+  writeConfig(home, {
+    version: 1,
+    active_profile: 'main',
+    current_model: 'image-2',
+    profiles: {
+      main: {
+        base_url: imageServer.baseUrl,
+        root_output_dir: outputDir,
+        keychain_account: 'main:x',
+      },
+    },
+  }, outputDir);
+
+  const result = await runNode(generatePath, [
+    '--prompt', 'x',
+    '--out-dir', outputDir,
+    '--json',
+    '--no-fallback',
+  ], home, stub.env);
+
+  assert.equal(result.code, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.images[0].source, 'url');
+  assert.match(payload.images[0].url, /\/files\/out\.png$/);
+  assert.equal(payload.images[0].display, payload.images[0].url, 'url 优先用远程地址展示');
+});
+
 test('setup stores family and api style, defaulting both to openai', async (t) => {
   const home = createTempDir();
   const outputDir = createTempDir();

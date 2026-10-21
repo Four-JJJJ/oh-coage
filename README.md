@@ -166,23 +166,25 @@ ln -s "/path/to/oh-coage/skills/oh-coage" ~/.claude/skills/oh-coage
 
 其他环境（普通 CLI agent、终端类宿主）不具备表单能力，会直接回退到聊天输入这一基线路径。判定方式是**先看能力再选路径**，不是先试表单再回退。
 
-无论走哪条路径，最终都需要这 4 个值：
+无论走哪条路径，最终都需要这 3 个值：
 
-1. 图片总保存到哪个文件夹
-2. profile 名称是什么
-3. 站点 URL 是什么
-4. API Key 是什么
+1. profile 名称是什么
+2. 站点 URL 是什么
+3. API Key 是什么
+
+**图片保存目录不是必填项。** 不传 `--output-dir` 时脚本会自动推导：有项目就落到项目根目录，否则落到桌面。
 
 然后运行：
 
 ```bash
 node "$SKILL_DIR/scripts/setup.js" \
-  --output-dir "/absolute/path/to/save" \
   --profile "default" \
   --base-url "https://your-image-site.example/v1" \
   --api-key "YOUR_KEY" \
   --activate
 ```
+
+需要自己指定目录时再加 `--output-dir "/absolute/path/to/save"`。
 
 首次初始化时，macOS 可能会弹出 Keychain 授权窗口。
 
@@ -313,6 +315,8 @@ node "$SKILL_DIR/scripts/generate.js" [options]
   - 可选，仅 OpenAI 官方接口支持
 - `--profile`
   - 可选，临时指定本次生成使用哪个 profile
+- `--json`
+  - 可选，输出结构化结果（含 `display` / `url` / `path`），便于直接在对话中展示图片
 - `--size`
   - 可选，默认 `1:1`
 - `--resolution`
@@ -345,7 +349,7 @@ node "$SKILL_DIR/scripts/setup.js" [options]
 主要参数：
 
 - `--output-dir`
-  - 初始化或新增 profile 时，指定图片总保存目录
+  - 初始化或新增 profile 时指定图片总保存目录；**可省略**，省略时自动落到项目根目录或桌面
 - `--profile`
   - 初始化或新增 profile 时，指定 profile 名
 - `--base-url`
@@ -711,9 +715,35 @@ node "$SKILL_DIR/scripts/setup.js" \
 
 ## 输出行为
 
-默认输出是**本地文件路径**，不是只给 URL。
+默认会落盘，并且同时给出**可直接展示的引用**。
 
-这是为了让用户直接拿到产物，减少再次下载的步骤。
+### `--json` 拿结构化结果
+
+```bash
+node "$SKILL_DIR/scripts/generate.js" --prompt "a blue mug" --json
+```
+
+```json
+{
+  "status": "success",
+  "family": "gemini",
+  "api": "openai",
+  "model": "gemini-nano-banana-2.1",
+  "run_dir": "/path/to/20261021-153012",
+  "images": [
+    { "source": "url", "url": "https://...", "path": "/path/to/a.png", "display": "https://..." }
+  ]
+}
+```
+
+`display` 是已经处理好的展示引用，直接用它渲染即可。
+
+### URL 与 base64 都兼容
+
+| `source` | 接口返回 | 展示用什么 |
+|---|---|---|
+| `url` | 图床地址 | `display` = 远程 URL（`path` 是同时落盘的副本） |
+| `base64` | 图片数据 | `display` = 本地文件路径（base64 不能直接当图片地址） |
 
 如果接口返回的是：
 
@@ -722,6 +752,8 @@ node "$SKILL_DIR/scripts/setup.js" \
   - 扩展名按响应 `content-type` 校正，不靠 URL 猜
   - 下载中断时会删掉残缺文件，不会给你留下一张看起来正常、实际打不开的空图
 - base64：脚本会直接解码为本地图片文件
+
+多图时全部落盘，stdout 一行一个路径。
 
 ## 临时覆盖机制
 

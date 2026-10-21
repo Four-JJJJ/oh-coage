@@ -567,11 +567,12 @@ function parseArgs() {
       case '--out-dir': parsed.outDir = path.resolve(value(i++, '--out-dir')); break;
       case '--profile': parsed.profile = value(i++, '--profile'); break;
       case '--no-fallback': parsed.autoFallback = false; break;
+      case '--json': parsed.json = true; break;
     }
   }
 
   if (!parsed.prompt) {
-    console.error('用法: node generate.js --prompt "提示词" [--family openai|gemini|grok] [--api openai|official] [--model NAME] [--profile NAME] [--size SIZE] [--resolution 1k|2k|4k] [--image-size 512|1K|2K|4K] [--n COUNT] [--quality QUALITY] [--style STYLE] [--background auto] [--output-format png] [--output-compression 0-100] [--moderation auto] [--response-format url] [--user USER] [--image-url URL] [--base-url URL] [--api-key KEY] [--output FILE | --out-dir DIR] [--no-fallback]');
+    console.error('用法: node generate.js --prompt "提示词" [--family openai|gemini|grok] [--api openai|official] [--model NAME] [--profile NAME] [--size SIZE] [--resolution 1k|2k|4k] [--image-size 512|1K|2K|4K] [--n COUNT] [--quality QUALITY] [--style STYLE] [--background auto] [--output-format png] [--output-compression 0-100] [--moderation auto] [--response-format url|b64_json] [--user USER] [--image-url URL] [--base-url URL] [--api-key KEY] [--output FILE | --out-dir DIR] [--json] [--no-fallback]');
     process.exit(1);
   }
 
@@ -840,9 +841,18 @@ async function runCandidate(candidate, cli, runRecord) {
         ? null
         : buildRunDir(candidate.rootOutputDir || process.cwd(), attemptStartedAt);
       const savedPaths = [];
+      const results = [];
       for (let imageIndex = 0; imageIndex < images.length; imageIndex++) {
-        const savedPath = await saveImage(images[imageIndex], candidate.outputOverride, runDir, imageIndex);
+        const image = images[imageIndex];
+        const savedPath = await saveImage(image, candidate.outputOverride, runDir, imageIndex);
         if (savedPath) savedPaths.push(savedPath);
+        results.push({
+          savedPath: savedPath || null,
+          // 远程 URL 原样保留；base64 落盘后靠本地路径展示
+          url: image.imageUrl || null,
+          mimeType: image.mimeType || null,
+          source: image.imageUrl ? 'url' : 'base64',
+        });
       }
       const savedPath = savedPaths[0] || null;
 
@@ -869,12 +879,13 @@ async function runCandidate(candidate, cli, runRecord) {
         completed_at: attempt.completed_at,
         saved_path: savedPath,
         saved_paths: savedPaths,
+        results,
         task_id: attempt.task_id || null,
         image_url_count: cli.imageUrls.length,
       });
 
       runRecord.attempts.push(attempt);
-      return { attempt, savedPath, savedPaths, runDir, images };
+      return { attempt, savedPath, savedPaths, runDir, images, results };
     } catch (error) {
       lastError = error;
       const classification = classifyError(error);
@@ -935,13 +946,36 @@ async function main() {
       runRecord.run_dir = result.runDir || null;
       writeRunLog(runRecord);
 
+      const results = result.results || [];
+      if (result.runDir) {
+        process.stderr.write(`图片目录: ${result.runDir}\n`);
+      }
+      results.forEach((item) => {
+        if (item.savedPath) process.stderr.write(`图片已保存到本地: ${item.savedPath}\n`);
+      });
+
+      if (cli.json) {
+        // 给调用方一份完整结构：URL 和 base64 两种返回都能落到可展示的引用
+        console.log(JSON.stringify({
+          status: 'success',
+          profile: candidate.name,
+          family: candidate.family,
+          api: candidate.apiStyle,
+          model: candidate.model.model,
+          run_dir: result.runDir || null,
+          images: results.map((item) => ({
+            source: item.source,
+            url: item.url,
+            path: item.savedPath,
+            mime_type: item.mimeType,
+            // 优先远程 URL（浏览器/宿主能直拉），否则用本地文件路径
+            display: item.url || item.savedPath || null,
+          })),
+        }, null, 2));
+        return;
+      }
+
       if (result.savedPaths?.length) {
-        result.savedPaths.forEach((savedPath) => {
-          process.stderr.write(`图片已保存到本地: ${savedPath}\n`);
-        });
-        if (result.runDir) {
-          process.stderr.write(`图片目录: ${result.runDir}\n`);
-        }
         // stdout 保持一行一个路径，方便调用方直接取
         result.savedPaths.forEach((savedPath) => console.log(savedPath));
         return;

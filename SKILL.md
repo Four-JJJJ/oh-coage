@@ -1,6 +1,6 @@
 ---
 name: oh-coage
-description: 使用可配置站点或官方接口生成图片，支持 OpenAI 兼容、Gemini（Nano Banana）与 Grok Imagine 三类模型，默认全部走 OpenAI 兼容生图接口，也可按用户要求切换到 Gemini / Grok 官方接口。支持文生图、图生图、模型切换、按 URL + Key 拉取可用模型、多 profile 保存与 fallback。当用户说"生图"、"画图"、"生成图片"、"oh-coage"、"gpt-image"、"Image2 生图"、"帮我画"、"用 gpt 画"、"用 2.5 画"、"用 banana 画"、"用 grok 画"、"切换模型"、"换模型"、"换个模型"、"改成 xxx 模型"、"使用 xxx 模型"、"有哪些模型"、"拉取模型"、"用官方接口"、"把这张图改成"、"参考这张图"等涉及 AI 图片生成、图片编辑、模型或接口切换的请求时触发此技能。首次使用时先做本地初始化：收集图片总保存目录、profile 名、站点 URL 和 API Key；支持聊天问答和可视化表单两种初始化方式；Key 写入本机 Keychain，本地配置文件只保存非敏感信息。
+description: 使用可配置站点或官方接口生成图片，支持 OpenAI 兼容、Gemini（Nano Banana）与 Grok Imagine 三类模型，默认全部走 OpenAI 兼容生图接口，也可按用户要求切换到 Gemini / Grok 官方接口。支持文生图、图生图、模型切换、按 URL + Key 拉取可用模型、多 profile 保存与 fallback。当用户说"生图"、"画图"、"生成图片"、"oh-coage"、"gpt-image"、"Image2 生图"、"帮我画"、"用 gpt 画"、"用 2.5 画"、"用 banana 画"、"用 grok 画"、"切换模型"、"换模型"、"换个模型"、"改成 xxx 模型"、"使用 xxx 模型"、"有哪些模型"、"拉取模型"、"用官方接口"、"把这张图改成"、"参考这张图"等涉及 AI 图片生成、图片编辑、模型或接口切换的请求时触发此技能。生成结果应直接在对话中展示图片，兼容接口返回 URL 与 base64 两种情况。首次使用时先做本地初始化：收集 profile 名、站点 URL 和 API Key（图片目录非必填，自动落到项目目录或桌面）；支持聊天问答和可视化表单两种初始化方式；Key 写入本机 Keychain，本地配置文件只保存非敏感信息。
 ---
 
 # oh-coage（入口指针）

@@ -34,6 +34,7 @@ const {
   isBuiltinModelKey,
   normalizeModelInput,
 } = require('./models');
+const { resolveDefaultOutputDir } = require('./resolve-output-dir');
 const {
   FAMILIES,
   normalizeFamily,
@@ -99,8 +100,8 @@ function parseArgs() {
 
 function printUsage() {
   console.error('用法:');
-  console.error('  初始化或新增 profile:');
-  console.error('    node setup.js --output-dir "/path/to/images" --profile "main" --base-url "https://example.com/v1" --api-key "KEY" [--activate] [--family openai|gemini|grok] [--api openai|official] [--model "image-2"]');
+  console.error('  初始化或新增 profile（--output-dir 可省，默认落到项目根或桌面）:');
+  console.error('    node setup.js --profile "main" --base-url "https://example.com/v1" --api-key "KEY" [--output-dir "/path/to/images"] [--activate] [--family openai|gemini|grok] [--api openai|official] [--model "image-2"]');
   console.error('  拉取该 profile 支持的模型（用它的 URL + Key）:');
   console.error('    node setup.js --sync-models [--profile "main"]');
   console.error('  列出 profile:');
@@ -525,13 +526,14 @@ function setProfileModel(options) {
  * 是否给出了初始化参数，用来区分「切换模型」和「初始化顺带指定模型」。
  * 注意不含 --profile：它既能当初始化参数，也能给 --profile-model 指定目标，
  * 单独出现时不足以说明用户想初始化。
+ * 注意不含 --output-dir：输出目录已经不是必填项，单独给它也不该触发初始化。
  */
 function isInitRequest(options) {
-  return Boolean(options.outputDir || options.baseUrl || options.apiKey);
+  return Boolean(options.baseUrl || options.apiKey);
 }
 
 function upsertProfile(options) {
-  if (!options.outputDir || !options.profile || !options.baseUrl || !options.apiKey) {
+  if (!options.profile || !options.baseUrl || !options.apiKey) {
     printUsage();
     process.exit(1);
   }
@@ -540,14 +542,19 @@ function upsertProfile(options) {
   const family = options.family ? normalizeFamily(options.family) : 'openai';
   const apiStyle = options.apiStyle ? normalizeApiStyle(options.apiStyle, family) : 'openai';
 
+  // 不强制用户选文件夹：没给就用「项目根 / 桌面」推导出来的默认目录
+  const outputDir = options.outputDir
+    ? path.resolve(options.outputDir)
+    : resolveDefaultOutputDir(process.cwd());
+
   // 存进去之前就拦住非法 base_url，别等到生成时才发现
   const normalizedBaseUrl = normalizeBaseUrl(options.baseUrl);
   assertValidBaseUrl(normalizedBaseUrl);
 
-  ensureDir(options.outputDir);
+  ensureDir(outputDir);
 
   const { config: existingConfig, configPath: activeConfigPath } = loadActiveConfig();
-  const configPath = activeConfigPath || getDefaultConfigPath(options.outputDir);
+  const configPath = activeConfigPath || getDefaultConfigPath(outputDir);
   const config = existingConfig || {
     version: 1,
     created_at: new Date().toISOString(),
@@ -569,7 +576,7 @@ function upsertProfile(options) {
     family,
     api_style: apiStyle,
     base_url: normalizedBaseUrl,
-    root_output_dir: options.outputDir,
+    root_output_dir: outputDir,
     keychain_account: keychainAccount,
     updated_at: new Date().toISOString(),
   };
@@ -591,7 +598,7 @@ function upsertProfile(options) {
   console.log(`profile: ${options.profile}`);
   console.log(`interface: ${describeProfile(config.profiles[options.profile])}`);
   console.log(`base_url: ${config.profiles[options.profile].base_url}`);
-  console.log(`root_output_dir: ${config.profiles[options.profile].root_output_dir}`);
+  console.log(`root_output_dir: ${config.profiles[options.profile].root_output_dir}${options.outputDir ? '' : '（未指定，已自动推导）'}`);
   console.log(`active_profile: ${config.active_profile}`);
   console.log(`profile_model: ${config.profiles[options.profile].model || '（跟随全局）'}`);
 }
