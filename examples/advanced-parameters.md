@@ -1,26 +1,32 @@
 # 高级参数使用示例
 
+> **适用接口：仅 OpenAI 兼容接口（`--api openai`，默认）。**
+> 这些字段在兼容接口下是**原样透传**给站点的，站点认不认取决于它自己的实现。
+> 切到 `--api official` 后取值会被严格校验，部分字段直接不支持（见文末「官方接口差异」）。
+
 ## 1. quality（图片质量）
 
 控制生成图片的质量级别。
 
-### 标准质量（默认）
+### 中质量（默认）
 ```bash
 node "$SKILL_DIR/scripts/generate.js" \
   --prompt "a beautiful sunset over mountains" \
-  --quality "standard"
+  --quality "medium"
 ```
 
-### 高清质量
+### 高质量
 ```bash
 node "$SKILL_DIR/scripts/generate.js" \
   --prompt "a beautiful sunset over mountains" \
-  --quality "hd"
+  --quality "high"
 ```
 
 **说明：**
-- `standard`：标准质量，生成速度快，成本低
-- `hd`：高清质量，细节更丰富，但生成时间更长，成本更高
+- 可用值：`low` / `medium` / `high` / `auto`（与代码里的 `OPENAI_QUALITY` 一致）
+- `medium`：标准质量，生成速度快，成本低
+- `high`：高质量，细节更丰富，但生成时间更长，成本更高
+- 兼容接口不校验取值，写错会原样发给站点然后吃 400；官方接口会本地直接报错
 
 ---
 
@@ -45,6 +51,8 @@ node "$SKILL_DIR/scripts/generate.js" \
 **说明：**
 - `vivid`：生动、鲜艳、夸张的风格，色彩饱和度高
 - `natural`：自然、真实、低调的风格，更接近照片感
+- ⚠️ `style` **仅兼容接口可用**（原样透传）。`--api official` 会直接报错
+  「OpenAI 官方接口 不接受参数：style」，因为官方接口没有这个字段
 
 ---
 
@@ -98,7 +106,7 @@ node "$SKILL_DIR/scripts/generate.js" \
   --prompt "a futuristic city at night with neon lights" \
   --size "16:9" \
   --resolution "4k" \
-  --quality "hd" \
+  --quality "high" \
   --style "vivid"
 ```
 
@@ -108,7 +116,7 @@ node "$SKILL_DIR/scripts/generate.js" \
   --prompt "portrait of a young woman in natural lighting" \
   --size "2:3" \
   --resolution "2k" \
-  --quality "hd" \
+  --quality "high" \
   --style "natural"
 ```
 
@@ -116,7 +124,7 @@ node "$SKILL_DIR/scripts/generate.js" \
 ```bash
 node "$SKILL_DIR/scripts/generate.js" \
   --prompt "abstract geometric patterns" \
-  --quality "standard" \
+  --quality "medium" \
   --style "vivid" \
   --user "project-alpha-user-001" \
   --profile "production"
@@ -127,7 +135,7 @@ node "$SKILL_DIR/scripts/generate.js" \
 node "$SKILL_DIR/scripts/generate.js" \
   --prompt "quick concept sketch of a robot" \
   --resolution "1k" \
-  --quality "standard" \
+  --quality "medium" \
   --style "vivid"
 ```
 
@@ -136,7 +144,7 @@ node "$SKILL_DIR/scripts/generate.js" \
 node "$SKILL_DIR/scripts/generate.js" \
   --prompt "turn this photo into an oil painting style" \
   --image-url "/path/to/reference.jpg" \
-  --quality "hd" \
+  --quality "high" \
   --style "vivid"
 ```
 
@@ -146,28 +154,28 @@ node "$SKILL_DIR/scripts/generate.js" \
 
 ### 适合快速原型/草稿
 ```bash
---resolution "1k" --quality "standard"
+--resolution "1k" --quality "medium"
 ```
 - 生成速度快，成本低
 - 适合快速验证想法
 
 ### 适合最终交付/打印
 ```bash
---resolution "4k" --quality "hd" --size "16:9"
+--resolution "4k" --quality "high" --size "16:9"
 ```
 - 最高质量
 - 适合需要高分辨率的场景
 
 ### 适合插画/艺术创作
 ```bash
---style "vivid" --quality "hd"
+--style "vivid" --quality "high"
 ```
 - 色彩鲜艳，视觉冲击力强
 - 适合海报、宣传物料
 
 ### 适合摄影/真实场景
 ```bash
---style "natural" --quality "hd"
+--style "natural" --quality "high"
 ```
 - 真实感强，接近照片
 - 适合产品展示、人像
@@ -178,11 +186,11 @@ node "$SKILL_DIR/scripts/generate.js" \
 
 1. **quality 和 resolution 的区别**
    - `resolution`：控制图片的像素尺寸（1k/2k/4k）
-   - `quality`：控制生成的细节和精细度（standard/hd）
+   - `quality`：控制生成的细节和精细度（low/medium/high/auto）
    - 两者可以独立设置，通常高分辨率配合高质量效果最好
 
 2. **成本考虑**
-   - `quality: hd` 通常比 `standard` 更贵
+   - `quality: high` 通常比 `medium` 更贵
    - `resolution: 4k` 比 `2k` 或 `1k` 更贵
    - 如果预算有限，优先保证 `quality`，再考虑 `resolution`
 
@@ -210,7 +218,7 @@ node "$SKILL_DIR/scripts/generate.js" \
   --prompt "a minimalist workspace with laptop and coffee" \
   --size "16:9" \
   --resolution "2k" \
-  --quality "standard" \
+  --quality "medium" \
   --style "natural"
 ```
 
@@ -220,7 +228,7 @@ node "$SKILL_DIR/scripts/generate.js" \
   --prompt "colorful abstract background for social media post" \
   --size "1:1" \
   --resolution "2k" \
-  --quality "hd" \
+  --quality "high" \
   --style "vivid"
 ```
 
@@ -230,7 +238,7 @@ node "$SKILL_DIR/scripts/generate.js" \
   --prompt "elegant floral pattern for wedding invitation" \
   --size "2:3" \
   --resolution "4k" \
-  --quality "hd" \
+  --quality "high" \
   --style "natural"
 ```
 
@@ -240,5 +248,28 @@ node "$SKILL_DIR/scripts/generate.js" \
   --prompt "layout concept for mobile app home screen" \
   --size "9:16" \
   --resolution "1k" \
-  --quality "standard"
+  --quality "medium"
 ```
+
+---
+
+## 官方接口差异
+
+切到 `--api official` 后，字段按家映射，且会**严格校验**，不再原样透传。
+
+| 参数 | `--api openai`（默认） | `--api official` |
+|---|---|---|
+| `--quality` | 原样透传 | `low` / `medium` / `high` / `auto` |
+| `--style` | 原样透传 | **不支持**，传了直接报错 |
+| `--resolution` | 原样透传（`1k`/`2k`/`4k`） | **不支持**（改用 `--size` 的像素值） |
+| `--size` | 比例，如 `1:1` / `16:9` | 像素值或比例别名，映射到 `1024x1024` / `1024x1536` / `1536x1024` |
+| `--background` | 原样透传 | `transparent` / `opaque` / `auto` |
+| `--output-format` | 原样透传 | `png` / `jpeg` / `webp` |
+| `--output-compression` | 原样透传 | `0`–`100` 整数 |
+| `--moderation` | 原样透传 | `auto` / `low` |
+
+**4K 降级**：`--resolution 4k` 只在 `16:9`、`9:16`、`2:1`、`1:2`、`21:9`、`9:21`
+这六个比例下可用。其它比例传 4k 会自动降级到 `2k`，并在 stderr 打印降级提示。
+
+**非法取值**：兼容接口现在也会拦截明显写错的 `--size`（如 `totally-bogus`）和
+`--resolution`（如 `99k`），不会再原样发给站点然后吃一个看不懂的 400。

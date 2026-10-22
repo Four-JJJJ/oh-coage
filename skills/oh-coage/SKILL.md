@@ -99,6 +99,18 @@ node "$SKILL_DIR/scripts/generate.js" --family grok --model grok-imagine-2 --pro
 
 模型名也支持 `族:短名` 写法，例如 `--model gemini:banana-2.1`。
 
+**`--family` 是过滤条件，不是「临时改身份」**：它只会从已有 profile 里挑出声明为该族的候选。
+所以上面两条命令要求**已经有一个 `--family gemini`（或 `grok`）的 profile**，否则会报
+`没有匹配 family=gemini 的 profile`。这种情况要先建 profile：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --profile "banana" --family gemini \
+  --base-url "https://your-gateway.example/v1" --api-key "KEY" --activate
+```
+
+聚合网关场景下，同一个 `base_url` 建两个 profile（一个 openai 族、一个 gemini 族）即可，
+两者都走兼容接口，只是声明的模型族不同。
+
 ### 拉取站点真实支持的模型
 
 模型列表因站点而异，用该 profile 自己的 URL 和 Keychain 里的 Key 拉一次：
@@ -107,8 +119,19 @@ node "$SKILL_DIR/scripts/generate.js" --family grok --model grok-imagine-2 --pro
 node "$SKILL_DIR/scripts/setup.js" --sync-models [--profile "main"]
 ```
 
-结果会写进 `profile.synced_models` 并合并进模型目录，之后就能直接 `--model <拉到的ID>` 使用。
-拉取只保留该模型族的生图模型；若一个都没识别到，会报错并提示用 `--add-model` 手动指定。
+结果会写进 `profile.synced_models` 并合并进模型目录，之后就能直接 `--model <拉到的ID>` 使用，
+也会出现在 `--list-models` 里。拉取只保留该模型族的生图模型；若一个都没识别到，会报错并提示用
+`--add-model` 手动指定。
+
+`--sync-models` 也可以和初始化写在同一条命令里（会先建 profile 再拉取）：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --profile "main" --base-url "..." --api-key "..." --sync-models
+```
+
+**注意模型族**：拉取只保留**该 profile 声明的族**的模型。openai 族的站点只会拉到
+`gpt-image-*` 这类，拉不到 `gemini-*`。要用 Gemini / Grok 模型，得单独建一个对应
+`--family` 的 profile。
 
 ### 用户要切换接口协议时
 
@@ -274,8 +297,15 @@ node "$SKILL_DIR/scripts/setup.js" --profile-model "image-2.5-flare" --profile "
 - `401` / `403`：不重试，直接判定该 profile 当前不可用并切换
 - Keychain 读不到 key：只跳过该 profile，不中断整轮
 - `base_url` 协议不是 `http`/`https`：尝试前就跳过该 profile
+- **图片已生成但下载失败**：不重试提交（重发等于重复扣费），直接换下一个 profile
 
-如果用户显式要求只用某一个 profile，或者显式禁用 fallback，才只跑单 profile。
+**只有加 `--no-fallback` 才会只跑单 profile。** 单给 `--profile` 不会禁用 fallback——
+它只是把该 profile 排到最前，失败后仍会尝试其它 profile。所以用户说「只用某个 profile」
+「别换站点」时，命令必须写成：
+
+```bash
+node "$SKILL_DIR/scripts/generate.js" --profile "backup" --no-fallback --prompt "..."
+```
 
 ### 初始化方式一：文字询问（默认路径）
 
@@ -490,16 +520,138 @@ node "$SKILL_DIR/scripts/generate.js" \
 - 如果用户给的是本地文件路径，可以直接传给脚本；脚本会自动读取文件并转为 base64 data URI 上传
 - 支持的本地图片格式：`png`、`jpg`、`jpeg`、`webp`、`gif`
 
+### 参考图字段怎么发（适配不同站点）
+
+各站点对参考图的字段名、传输方式、端点写法都不统一，所以这三件事做成可配置的。**不配就是内置默认，行为和以前完全一致。**
+
+默认（`api=openai`）：JSON 请求体，参考图放在 `image_urls`，打 `POST /images/generations`。
+
+| 配置项 | 取值 | 默认 |
+|---|---|---|
+| `image_transport` | `json` / `multipart` | `json` |
+| `image_field` | 任意字段名，常用 `image_urls`、`image`、`images`、`image_url`、`input_image`、`init_image`、`reference_images` | `json` 时 `image_urls`；`multipart` 时 `image` |
+| `image_shape` | `array`（`["data:..."]`）/ `array-object`（`[{"url":"..."}]`）/ `single`（单值字符串） | `image_urls` 系字段为 `array`；`images` / `input_images` / `reference_images` 自动为 `array-object` |
+| `image_endpoint` | 相对路径或完整 URL | `json` 时 `/images/generations`；`multipart` 时 `/images/edits` |
+
+`image_shape` 三个取值的实际效果：
+
+| 取值 | 发出去的 JSON |
+|---|---|
+| `array` | `"image_urls": ["data:...", "data:..."]` |
+| `array-object` | `"images": [{"url": "data:..."}, {"url": "data:..."}]` |
+| `single` | `"image_url": "data:..."` |
+
+**`single` 只能配一张参考图。** 传多张会直接报错并提示改用 `array` / `array-object`，
+不会静默丢掉多余的图。
+
+常见站点的对法：
+
+| 站点认的写法 | 该配什么 |
+|---|---|
+| `image_urls` 字符串数组（默认） | 什么都不用配 |
+| `image` / `image[]` 文件上传（OpenAI `/images/edits`、多数改图接口） | `--image-transport multipart` |
+| `images: [{"url": ...}]` | `--image-field images` |
+| `image_url` 单张字符串 | `--image-field image_url --image-shape single` |
+| 改图走别的路径，比如 `/v1/image/edit` | 再加 `--image-endpoint /image/edit` |
+
+`multipart` 会把参考图当成真正的文件字段上传（文件名 `reference-1.png` 等），**只支持本地文件或 data URI**。传远程 URL 会直接报错，提示先下载到本地或改用 `json`。
+
+注意 `api=official` 的 OpenAI 官方接口本来就该走 `/images/edits` + multipart，现在给参考图时会自动这么发，不用额外配。
+
+### 配置适配项
+
+写到 profile 里，之后每次图生图都生效：
+
+```bash
+# 该站点要 multipart 文件上传
+node "$SKILL_DIR/scripts/setup.js" --image-transport multipart
+
+# 字段名和形状都要指定
+node "$SKILL_DIR/scripts/setup.js" --image-field images
+
+# 连端点一起指定
+node "$SKILL_DIR/scripts/setup.js" --image-field image_url --image-shape single --image-endpoint /image/edit
+
+# 清除，回到内置默认
+node "$SKILL_DIR/scripts/setup.js" --clear-image-options
+```
+
+不写 `--profile` 就作用于当前 profile。初始化时也能一次带上这些参数。
+
+单次覆盖用 `generate.js` 的同名参数，优先级是：`generate.js` 参数 > profile 配置 > 内置默认。
+
+```bash
+node "$SKILL_DIR/scripts/generate.js" \
+  --prompt "把这张图改成水彩风格" \
+  --image-url "/path/to/photo.png" \
+  --image-transport multipart
+```
+
+`setup.js --list` 会把非默认的适配项一并打出来，方便确认当前站点到底怎么发。
+
+### 遇到 400 时怎么排查
+
+生成时 stderr 会打印一行 `参考图片: N 张；适配: 端点=..., 传输=..., 字段=..., 形状=...`，先看这一行：
+
+1. 端点对不对：站点改图接口不是 `/images/generations` 就配 `--image-endpoint`
+2. 传输对不对：报 `multipart/form-data` 相关错误就切 `--image-transport multipart`，报 JSON 解析错误就切回 `json`
+3. 字段名对不对：看站点文档里参考图叫什么，直接配 `--image-field`
+4. 形状对不对：报类型错误（期望数组却给了对象，或反过来）就调 `--image-shape`
+
+不确定站点认哪一种时，先保持默认试一次；默认那套对大多数中转站有效。
+
 ## 参数选择
 
 ### 默认（OpenAI 兼容接口）
 
-- `size` 默认 `1:1`，宽屏优先 `16:9`，竖屏/壁纸优先 `9:16`，海报优先 `2:3`
-- `resolution` 默认 `2k`；用户说高清或 4K 时优先 `4k`，说快速/省钱时优先 `1k`
-- `n` 可选，生成多张（各接口上限不同，Grok 官方接口为 1–10）
-- `quality` / `style` / `response_format` / `user` 会原样透传，兼容不同中转站
+- `--size` 默认 `1:1`，宽屏优先 `16:9`，竖屏/壁纸优先 `9:16`，海报优先 `2:3`
+- `--resolution` 默认 `2k`；用户说高清或 4K 时优先 `4k`，说快速/省钱时优先 `1k`
+- `--n` 可选，生成多张（各接口上限不同，Grok 官方接口为 1–10）
+- `--quality` / `--style` / `--response-format` / `--user` 会原样透传，兼容不同中转站
 
 默认模型是 `gpt-image-2`。用户没有提模型时，不要主动换成 2.5 系列——2.5 是不同档位，可能更贵。
+
+### 全部可用参数
+
+生成（`generate.js`）：
+
+| 参数 | 说明 |
+|---|---|
+| `--prompt` | **必填**，提示词 |
+| `--family` | `openai` / `gemini` / `grok` |
+| `--api` | `openai`（默认）/ `official` |
+| `--model` | 单次指定模型，不改持久配置 |
+| `--profile` | 指定优先尝试的 profile（**不会**禁用 fallback） |
+| `--size` | 比例，如 `1:1` / `16:9` |
+| `--resolution` | `1k` / `2k` / `4k` |
+| `--image-size` | `512` / `1K` / `2K` / `4K`（Gemini 官方） |
+| `--n` | 生成张数 |
+| `--quality` | 质量，官方接口限 `low`/`medium`/`high`/`auto` |
+| `--style` | 风格（**仅兼容接口**，官方接口不支持） |
+| `--background` / `--output-format` / `--output-compression` / `--moderation` | OpenAI 官方接口专属 |
+| `--response-format` | `url` / `b64_json` |
+| `--user` | 用户标识 |
+| `--image-url` | 参考图，可重复；支持 URL / data URI / 本地路径 |
+| `--image-field` / `--image-transport` / `--image-shape` / `--image-endpoint` | 图生图适配 |
+| `--base-url` / `--api-key` | 单次覆盖站点与密钥 |
+| `--out-dir` | 本次输出的总目录（每次生成仍会新建时间子目录） |
+| `--output` | 本次输出到指定文件（多图自动加 `-2`/`-3`） |
+| `--json` | stdout 输出结构化 JSON |
+| `--no-fallback` | **只用第一个候选 profile**，失败不换 |
+
+**`--profile` 和 `--no-fallback` 的区别**（容易混）：
+
+- `--profile backup`：把 `backup` 排到最前，失败后**仍会**尝试其它 profile
+- `--profile backup --no-fallback`：只用 `backup`，失败就报错
+
+用户说「只用某个 profile」「别换站点」时，必须同时给 `--no-fallback`。
+
+### 尺寸与分辨率校验
+
+- 兼容接口只校验**格式**：`--size` 必须是比例（`1:1`、`16:9`），`--resolution` 必须是 `1k`/`2k`/`4k`
+- 传像素值（`1024x1024`）会被拒绝并提示改用 `--api official`
+- `--resolution 4k` 只在 `16:9`、`9:16`、`2:1`、`1:2`、`21:9`、`9:21` 下可用；
+  其它比例会自动降级到 `2k` 并在 stderr 提示
 
 ### 官方接口专属参数
 
@@ -510,6 +662,26 @@ node "$SKILL_DIR/scripts/generate.js" \
 - **Grok 官方**：`--size` 作 `aspect_ratio`，`--resolution 1k|2k`，`--quality low|medium|auto`，`--response-format url|b64_json`；不支持 `background` / `output_format` / `style`
 
 传了该家不支持的字段会报错，这时要么去掉，要么换接口协议。
+
+## 错误语义与重试
+
+脚本会自动区分「该重试」和「不该重试」的错误，不要自己再包一层重试逻辑。
+
+| 情况 | 行为 | 原因 |
+|---|---|---|
+| 401 / 403 | 不重试，换下一个 profile | 鉴权失败，重试无意义 |
+| 408 / 429 / 5xx | 同 profile 退避重试 1 次，仍失败再换 profile | 服务端明确失败，没产出图片 |
+| 连接被拒绝 / 域名解析失败 | 重试 | 请求根本没发出去 |
+| **超时 / 连接被重置** | **不重试提交**，直接换 profile | 服务端可能已收到并计费，重发等于重复扣费 |
+| **图片已生成但下载失败** | **不重试提交**，直接换 profile | 同上；错误信息会写「不会重试提交」 |
+| Keychain 读不到 key | 跳过该 profile | 只影响这一个 profile |
+| 非图片响应（错误页/限流 JSON） | 报错，不落盘 | 避免「显示成功但图片是坏的」 |
+
+用户看到「不会重试提交」时，说明**图片已经生成成功、钱已经花了，只是没下载下来**。
+这时不要建议用户重跑（会再扣一次费），而应该：
+
+1. 检查网络能否访问图片 URL
+2. 或用 `--profile` 换一个更稳定的站点
 
 ## 输出与展示
 

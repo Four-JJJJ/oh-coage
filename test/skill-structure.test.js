@@ -108,3 +108,94 @@ test('the authoritative doc spells out the model-switching flow', () => {
   assert.match(source, /不要自己猜|不要替用户猜/, '不完整的模型说法必须问清而不是猜');
   assert.match(source, /--profile-model/, '应说明「只让某个站点用」要用 --profile-model');
 });
+
+// ---------------------------------------------------------------------------
+// 文档与代码一致性
+//
+// 这几条断言是「结构性防线」：文档靠手抄代码常量，一旦代码改了文档没改，
+// 或者文档写了代码里不存在的 flag，这里就会红。
+// ---------------------------------------------------------------------------
+
+function parseFlags(scriptPath) {
+  const source = fs.readFileSync(scriptPath, 'utf8');
+  const flags = new Set();
+  for (const match of source.matchAll(/case '(--[a-z-]+)'/g)) {
+    flags.add(match[1]);
+  }
+  return flags;
+}
+
+test('every generate.js flag is documented in the authoritative doc', () => {
+  const source = fs.readFileSync(skillDocPath, 'utf8');
+  const flags = parseFlags(path.join(skillDir, 'scripts', 'generate.js'));
+
+  const missing = [...flags].filter((flag) => !source.includes(`\`${flag}\``) && !source.includes(flag));
+  assert.deepEqual(missing, [], `SKILL.md 未记录这些 generate.js 参数：${missing.join(', ')}`);
+});
+
+test('every setup.js flag is documented in the authoritative doc', () => {
+  const source = fs.readFileSync(skillDocPath, 'utf8');
+  const flags = parseFlags(path.join(skillDir, 'scripts', 'setup.js'));
+
+  const missing = [...flags].filter((flag) => !source.includes(flag));
+  assert.deepEqual(missing, [], `SKILL.md 未记录这些 setup.js 参数：${missing.join(', ')}`);
+});
+
+test('the doc does not invent flags that the scripts do not support', () => {
+  const source = fs.readFileSync(skillDocPath, 'utf8');
+  const supported = new Set([
+    ...parseFlags(path.join(skillDir, 'scripts', 'generate.js')),
+    ...parseFlags(path.join(skillDir, 'scripts', 'setup.js')),
+  ]);
+
+  // 只检查「看起来像 CLI flag」且带反引号的行内代码
+  const documented = new Set();
+  for (const match of source.matchAll(/`(--[a-z][a-z-]+)/g)) {
+    documented.add(match[1]);
+  }
+
+  const invented = [...documented].filter((flag) => !supported.has(flag));
+  assert.deepEqual(invented, [], `SKILL.md 出现了脚本不支持的参数：${invented.join(', ')}`);
+});
+
+test('documented quality values match the code constant', () => {
+  const { OPENAI_QUALITY_VALUES } = require('../skills/oh-coage/scripts/providers');
+  const doc = fs.readFileSync(skillDocPath, 'utf8');
+
+  for (const value of OPENAI_QUALITY_VALUES) {
+    assert.ok(doc.includes(value), `SKILL.md 未提到 quality 取值 ${value}`);
+  }
+
+  // 文档里不应再出现 DALL·E 时代的旧取值
+  assert.doesNotMatch(doc, /--quality\s+"?(standard|hd)\b/, 'quality 不应使用 standard/hd（代码里没有这两个值）');
+});
+
+test('documented 4K ratios match the code constant', () => {
+  const { VALID_4K_SIZES } = require('../skills/oh-coage/scripts/providers');
+  const doc = fs.readFileSync(skillDocPath, 'utf8');
+
+  for (const ratio of VALID_4K_SIZES) {
+    assert.ok(doc.includes(ratio), `SKILL.md 未提到 4K 支持的比例 ${ratio}`);
+  }
+});
+
+test('examples do not use quality values that the code rejects', () => {
+  const examplesDir = path.join(repoRoot, 'examples');
+  for (const name of fs.readdirSync(examplesDir)) {
+    const source = fs.readFileSync(path.join(examplesDir, name), 'utf8');
+    assert.doesNotMatch(
+      source,
+      /--quality\s+"?(standard|hd)\b/,
+      `${name} 用了代码里不存在的 quality 取值（应为 low/medium/high/auto）`,
+    );
+  }
+});
+
+test('the README model count matches the built-in registry', () => {
+  const { ALL_BUILTIN_MODELS } = require('../skills/oh-coage/scripts/models');
+  const readme = fs.readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
+
+  // README 声称「9 个内置模型」，注册表变了这里就要跟着改
+  assert.match(readme, new RegExp(`${ALL_BUILTIN_MODELS.length} 个内置模型`),
+    `README 的内置模型数量与注册表（${ALL_BUILTIN_MODELS.length} 个）不一致`);
+});

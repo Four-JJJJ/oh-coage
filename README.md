@@ -11,10 +11,11 @@
 - 把非敏感配置写进用户指定目录下的本地配置文件
 - 支持多个 profile 之间切换
 - 支持文生图、图生图、同步返回接口、异步任务接口
+- 图生图适配：字段名、传输方式（JSON / multipart）、取值形状、端点均可配置
 
 ## 功能概览
 
-- 模型可选：3 个内置模型 + 自定义模型，可持久切换
+- 模型可选：9 个内置模型（openai 3 / gemini 5 / grok 1）+ 自定义模型，可持久切换
 - 首次使用初始化
 - 默认本地保存图片
 - 多 profile 管理
@@ -25,6 +26,7 @@
 - 兼容：
   - 同步接口：请求后直接返回图片 URL 或 base64
   - 异步接口：提交任务后轮询结果
+  - 图生图：可配置参考图字段名、JSON / multipart 传输、取值形状与端点
 
 ## 目录结构
 
@@ -37,12 +39,15 @@
     ├── assets/
     │   └── oh-coage-init-form.html
     └── scripts/
-        ├── config-store.js
-        ├── generate.js
-        ├── models.js
-        ├── resolve-output-dir.js
-        └── setup.js
+        ├── config-store.js        # 配置/Keychain/运行日志
+        ├── generate.js            # 生成 CLI：候选调度、HTTP、轮询、落盘
+        ├── models.js              # 模型注册表与短名解析
+        ├── providers.js           # 模型族 × 接口协议适配
+        ├── resolve-output-dir.js  # 默认输出目录推导
+        └── setup.js               # 初始化与 profile 管理
 ```
+
+另有 `examples/`（参数与图生图示例）和 `test/`（node --test 用例）。
 
 `skills/oh-coage/` 是可以整体拷走或软链的完整 skill 目录，`SKILL.md`、`scripts/`、`assets/` 三者同级。下文命令中的 `$SKILL_DIR` 即指这个目录。
 
@@ -108,7 +113,7 @@ codex plugin add oh-coage@oh-coage
 `--ref main` 跟随最新提交。如果你想要可复现的稳定版本，改用已发布的 tag（版本号见 [Releases](https://github.com/Four-JJJJ/oh-coage/releases)）：
 
 ```bash
-codex plugin marketplace add Four-JJJJ/oh-coage --ref v0.3.0
+codex plugin marketplace add Four-JJJJ/oh-coage --ref v0.8.0
 codex plugin add oh-coage@oh-coage
 ```
 
@@ -288,6 +293,53 @@ node "$SKILL_DIR/scripts/generate.js" \
 
 支持的本地图片格式：`png`、`jpg`、`jpeg`、`webp`、`gif`。
 
+### 参考图怎么发给接口（适配不同站点）
+
+不同站点对参考图的字段名、传输方式和端点写法各不相同，所以这三件事做成可配置的。**全部不配就是内置默认，行为和以前完全一致。**
+
+默认（`api=openai`）：JSON 请求体，参考图放 `image_urls`，打 `POST /images/generations`。
+
+| 配置项 | 取值 | 默认 |
+|---|---|---|
+| `image_transport` | `json` / `multipart` | `json` |
+| `image_field` | 任意字段名，如 `image_urls`、`image`、`images`、`image_url`、`input_image`、`init_image`、`reference_images` | `json` 时 `image_urls`，`multipart` 时 `image` |
+| `image_shape` | `array` / `array-object` / `single` | `image_urls` 类为 `array`；`images` / `input_images` / `reference_images` 自动 `array-object` |
+| `image_endpoint` | 相对路径或完整 URL | `json` 时 `/images/generations`，`multipart` 时 `/images/edits` |
+
+常见站点对法：
+
+| 站点认的写法 | 该配什么 |
+|---|---|
+| `image_urls` 字符串数组（默认） | 不用配 |
+| `image` / `image[]` 文件上传（OpenAI `/images/edits`、多数改图接口） | `--image-transport multipart` |
+| `images: [{"url": ...}]` | `--image-field images` |
+| `image_url` 单张字符串 | `--image-field image_url --image-shape single` |
+| 改图在别的路径，如 `/v1/image/edit` | 再加 `--image-endpoint /image/edit` |
+
+`multipart` 会把参考图当真正的文件字段上传（文件名 `reference-1.png` 等），只支持本地文件或 data URI；传远程 URL 会直接报错并提示先下载或改回 `json`。
+
+`api=official` 的 OpenAI 官方接口给参考图时，会自动走 `/images/edits` + multipart，不需要额外配置。
+
+写到 profile 里长期生效：
+
+```bash
+node "$SKILL_DIR/scripts/setup.js" --image-transport multipart
+node "$SKILL_DIR/scripts/setup.js" --image-field images
+node "$SKILL_DIR/scripts/setup.js" --image-field image_url --image-shape single --image-endpoint /image/edit
+node "$SKILL_DIR/scripts/setup.js" --clear-image-options   # 回到内置默认
+```
+
+单次覆盖用 `generate.js` 的同名参数，优先级：`generate.js` 参数 > profile 配置 > 内置默认。
+
+```bash
+node "$SKILL_DIR/scripts/generate.js" \
+  --prompt "turn this into watercolor style" \
+  --image-url "/path/to/input.png" \
+  --image-transport multipart
+```
+
+生成时 stderr 会打印 `参考图片: N 张；适配: 端点=..., 传输=..., 字段=..., 形状=...`，遇到 400 先看这一行定位是端点、传输、字段名还是形状不对。
+
 ## 参数说明
 
 ### `generate.js`
@@ -331,6 +383,14 @@ node "$SKILL_DIR/scripts/generate.js" [options]
   - 可选，用户标识（用于追踪和滥用监控）
 - `--image-url`
   - 可选，图生图参考图
+- `--image-field`
+  - 可选，参考图字段名（默认 `image_urls`，`multipart` 时默认 `image`）
+- `--image-transport`
+  - 可选，`json`（默认）/ `multipart`；`multipart` 会把参考图作为文件字段上传
+- `--image-shape`
+  - 可选，参考图取值形状：`array` / `array-object` / `single`
+- `--image-endpoint`
+  - 可选，覆盖默认端点（`/images/generations` 或 `/images/edits`）
 - `--base-url`
   - 可选，临时覆盖 profile 中的 `base_url`
 - `--api-key`
@@ -388,6 +448,11 @@ node "$SKILL_DIR/scripts/setup.js" [options]
 - `--profile-model`
   - 给某个 profile 固定模型；不写 `--profile` 则作用于当前 active profile
   - 传 `none` 取消固定，改为跟随全局当前模型
+- `--image-transport` / `--image-field` / `--image-shape` / `--image-endpoint`
+  - 配置图生图适配；不写 `--profile` 则作用于当前 active profile
+  - 初始化时也能一起带上，一次配好
+- `--clear-image-options`
+  - 清除图生图适配，回到内置默认（JSON + `image_urls` + `/images/generations`）
 
 ## 多 profile 管理
 
@@ -690,9 +755,18 @@ node "$SKILL_DIR/scripts/setup.js" \
 - 竖屏 / 手机壁纸：`9:16`
 - 海报：`2:3`
 
-支持的比例：
+**兼容接口（默认）**不限制具体比例——只校验「是不是比例格式」（如 `1:1`、`16:9`），
+然后原样透传给站点。实际能用的比例取决于你的站点支持哪些。常见的有：
 
-`auto`、`1:1`、`3:2`、`2:3`、`4:3`、`3:4`、`5:4`、`4:5`、`16:9`、`9:16`、`2:1`、`1:2`、`21:9`、`9:21`
+`1:1`、`3:2`、`2:3`、`4:3`、`3:4`、`16:9`、`9:16`、`2:1`、`1:2`、`21:9`、`9:21`
+
+**官方接口**会严格校验，各家的可用值不同：
+
+| 接口 | 可用比例 |
+|---|---|
+| `--api openai` | `auto`、`1:1`、`2:3`、`3:2`（会映射成像素值） |
+| `--family gemini --api official` | `1:1`、`2:3`、`3:2`、`3:4`、`4:3`、`4:5`、`5:4`、`9:16`、`16:9`、`21:9`（**不含 `auto`**） |
+| `--family grok --api official` | `auto`、`1:1`、`16:9`、`9:16`、`4:3`、`3:4`、`3:2`、`2:3`、`2:1`、`1:2`、`19.5:9`、`9:19.5`、`20:9`、`9:20`、`21:9`、`5:2` |
 
 ### 分辨率建议
 
@@ -711,7 +785,10 @@ node "$SKILL_DIR/scripts/setup.js" \
 - `21:9`
 - `9:21`
 
-如果用户传了不支持的比例，脚本会自动降级到 `2k`。
+传了不支持的比例时，脚本会**自动降级到 `2k`** 并在 stderr 打印降级提示，不会把非法组合发给站点。
+
+此外，兼容接口现在会拦截明显写错的取值：`--size` 必须是比例（`1:1`、`16:9` 这类），
+`--resolution` 必须是 `1k`/`2k`/`4k`。传像素值（如 `1024x1024`）会提示改用 `--api official`。
 
 ## 输出行为
 
@@ -844,6 +921,16 @@ node "$SKILL_DIR/scripts/generate.js" \
   --no-fallback
 ```
 
+⚠️ **`--profile` 本身不会禁用 fallback。** 它只是把该 profile 排到候选链最前面，
+失败后仍会继续尝试其它 profile。要「只用这一个 profile」必须显式加 `--no-fallback`：
+
+```bash
+node "$SKILL_DIR/scripts/generate.js" \
+  --profile "backup" \
+  --prompt "a blue mug" \
+  --no-fallback        # ← 不加这行就仍会自动换 profile
+```
+
 ## 运行日志
 
 每次生成都会写入：
@@ -855,7 +942,7 @@ node "$SKILL_DIR/scripts/generate.js" \
 每条日志会记录：
 
 - 开始时间
-- prompt 摘要
+- 完整 prompt（`prompt` 字段）+ 前 200 字符预览（`prompt_preview`）+ SHA1（`prompt_sha1`）
 - 使用的 profile
 - 使用的模型（`model` / `model_key` / `model_source`，以及显式指定的 `requested_model`）
   - `model_source` 取值：`cli`（`--model` 指定）/ `profile`（profile 固定）/ `config`（全局当前）/ `default`
@@ -865,6 +952,14 @@ node "$SKILL_DIR/scripts/generate.js" \
 - 总耗时
 
 错误正文会被截断到 500 字符再落盘，避免上游返回的大段 HTML 或 base64 把日志撑爆。
+
+⚠️ **`runs.jsonl` 里存的是完整 prompt 明文**，因为排查问题需要它。所以：
+
+- `~/.oh-coage/` 目录权限是 `0700`，`runs.jsonl` 和 `state.json` 是 `0600`（仅属主可读）
+- 如果 prompt 里有敏感内容，用 `setup.js --uninstall-skill --purge-logs` 清掉
+- 生成的图片目录里 `meta.json` 同样含完整 prompt 和 base_url
+
+
 
 ## 安全说明
 
@@ -880,6 +975,23 @@ node "$SKILL_DIR/scripts/generate.js" \
 
 - 配置文件保存非敏感字段
 - Keychain 保存真实 key
+
+### 密钥会去哪里
+
+- 正常情况：只发给 profile 里配置的 `base_url`
+- 用 `--base-url` 临时覆盖站点时，脚本会警告「Keychain 里的 key 会被发到新地址」
+- 用 `--image-endpoint` 指到**不同域名**时，脚本会警告「API Key 会一并发送到该地址」
+  - 这是少数网关把生图/改图放在不同域名的合法场景，但必须让用户知道代价
+- `--api-key` 写在命令行上时，密钥会短暂出现在进程列表（`ps` 可见）；
+  更安全的方式是环境变量 `IMAGES2_GEN_API_KEY`
+
+### 计费安全
+
+图片**生成成功后**如果下载失败，脚本**不会重发**生成请求（重发等于重复扣费），
+而是标记为「下载失败」直接切换下一个 profile。错误信息里会明确写「不会重试提交」。
+
+非图片响应（站点错误页、限流 JSON）不会被当成图片落盘：脚本会按文件头校验，
+不匹配就报错，避免出现「显示成功但图片是坏的」。
 
 ## 常见问题
 
@@ -953,26 +1065,48 @@ node "$SKILL_DIR/scripts/setup.js" \
 
 ## 开发与测试
 
-需要 Node.js `>= 18`。
+需要 Node.js `>= 20`（覆盖率门槛依赖 `--experimental-test-coverage`）。
 
 ```bash
-npm run check   # 四个脚本的语法检查
-npm test        # 全部测试（node --test）
+npm run check            # 6 个脚本的语法检查
+npm test                 # 全部测试（node --test，141 项）
+npm run test:regressions # 只跑已修缺陷的回归用例
+npm run coverage         # 覆盖率 + 门槛校验
 ```
 
-测试不依赖真实站点，也不写真实 Keychain：全部用本地 mock HTTP 服务 + 临时 `HOME` 目录跑。
+CI 在 `.github/workflows/test.yml`：Ubuntu + macOS × Node 20/22 矩阵，
+跑 `check` → `test` → `coverage`。
 
-覆盖范围包括：
+### 测试隔离原则
 
-- 配置文件读写、相对路径解析、派生字段不落盘
+测试**不依赖真实站点、不写真实 Keychain、不写仓库目录**：
+
+- 假站点：`test/helpers.js` 的 `startServer()` 起本地 `127.0.0.1` 服务，端口随机
+- 假钥匙串：`securityStub()` 把假 `security` 排到 `PATH` 最前
+- 隔离 HOME：每个用例一个临时 `HOME`，`runNode()` 强制要求显式传入
+- 慢测试：重试退避可用 `OH_COAGE_RETRY_DELAY_MS=0` 归零，避免真等 1 秒
+
+### 覆盖范围
+
+- 配置文件读写、相对路径解析、派生字段不落盘、配置并发写加锁
 - 模型注册表解析、歧义拒绝、自定义模型增删、当前模型持久切换
-- profile 固定模型、fallback 链上各 profile 各用各的模型
-- 初始化与 `--model` 组合（先初始化再切换）、`security` 以 stub 替代以避开真实钥匙串
-- 图生图本地上传、缺失参考图报错
-- 下载跟随跳转、扩展名按 `content-type` 纠正、失败清理残文件
-- 异步任务轮询节奏、瞬时故障重试、终态识别、结构非法快速失败
-- 5xx 同 profile 重试、Keychain 读取失败 fallback、非法 `base_url` 拒绝
+- profile 固定模型、fallback 链顺序（含 `priority`）、`--no-fallback` 语义
+- 初始化与 `--model` 组合、`--sync-models` 与初始化同用、`--list-models` 展示
+- 图生图本地上传、形状解析（`array` / `array-object` / `single`）、multipart 拼装
+- 下载跟随跳转、扩展名纠正、失败清理残文件、**非图片响应拒绝落盘**
+- 异步任务轮询节奏、瞬时故障重试、终态识别、**多图全部回收**
+- 5xx 同 profile 重试、**非幂等 POST 不在连接重置后重发**、Keychain 失败 fallback
+- 4K 降级、非法 `size`/`resolution` 拒绝、跨域端点告警
 - 初始化表单结构、skill 目录自包含性、文档引用可达性
+
+### 回归用例优先
+
+`test/regressions.test.js` 里的每个用例都对应一个真实发生过的缺陷，
+注释写明了「如果改坏了会怎样」。改动相关代码后优先跑它：
+
+```bash
+npm run test:regressions
+```
 
 ## Acknowledgements
 
