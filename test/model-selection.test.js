@@ -444,7 +444,7 @@ test('generate warns when --base-url overrides the site but still uses the Keych
     '--base-url', 'http://127.0.0.1:1/v1',
     '--out-dir', outputDir,
     '--no-fallback',
-  ], ctx.home, stub.env);
+  ], ctx.home, { ...stub.env, OH_COAGE_RETRY_DELAY_MS: '0' });
 
   assert.match(result.stderr, /警告：本次用 --base-url 覆盖了站点地址/);
   assert.match(result.stderr, /--api-key/);

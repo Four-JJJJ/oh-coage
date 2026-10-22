@@ -12,6 +12,10 @@
 const FAMILIES = ['openai', 'gemini', 'grok'];
 const API_STYLES = ['openai', 'official'];
 
+// 图生图适配维度：各站点的参考图字段名、传输方式、端点都不一样，做成可配置的
+const IMAGE_TRANSPORTS = ['json', 'multipart'];
+const IMAGE_FIELD_SHAPES = ['array', 'array-object', 'single'];
+
 const FAMILY_ALIASES = new Map([
   ['openai', 'openai'],
   ['image', 'openai'],
@@ -76,6 +80,45 @@ const OPENAI_SIZE_ALIASES = new Map([
   ['3:2', '1536x1024'],
   ['1536x1024', '1536x1024'],
 ]);
+
+// 参考图字段的常见写法。不同中转站/官方接口各认一套，所以做成 profile 可配置。
+const IMAGE_FIELD_ALIASES = new Map([
+  ['image_urls', 'image_urls'],
+  ['imageurls', 'image_urls'],
+  ['images', 'images'],
+  ['image', 'image'],
+  ['image_url', 'image_url'],
+  ['imageurl', 'image_url'],
+  ['input_image', 'input_image'],
+  ['input_images', 'input_images'],
+  ['init_image', 'init_image'],
+  ['init_images', 'init_images'],
+  ['reference_images', 'reference_images'],
+  ['reference_image', 'reference_image'],
+  ['ref_images', 'reference_images'],
+]);
+
+const IMAGE_TRANSPORT_ALIASES = new Map([
+  ['json', 'json'],
+  ['body', 'json'],
+  ['multipart', 'multipart'],
+  ['form', 'multipart'],
+  ['form-data', 'multipart'],
+  ['formdata', 'multipart'],
+]);
+
+const IMAGE_FIELD_SHAPE_ALIASES = new Map([
+  ['array', 'array'],
+  ['list', 'array'],
+  ['array-object', 'array-object'],
+  ['array-of-objects', 'array-object'],
+  ['object-array', 'array-object'],
+  ['single', 'single'],
+  ['string', 'single'],
+]);
+
+// 参考图落在这些字段里时，天然就是「对象数组」形状
+const OBJECT_SHAPED_FIELDS = new Set(['images', 'input_images', 'reference_images']);
 
 const GEMINI_ASPECT_RATIOS = new Set(['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9']);
 const GEMINI_IMAGE_SIZES = new Set(['512', '1K', '2K', '4K']);
@@ -145,40 +188,217 @@ function parseDataUri(value) {
 }
 
 /**
+ * 参考图字段名。允许自定义任意名字（站点各写各的），
+ * 但必须是安全的标识符，否则拼进 multipart 头会出问题。
+ */
+function normalizeImageField(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+
+  const normalized = IMAGE_FIELD_ALIASES.get(raw.toLowerCase()) || raw;
+  if (!/^[A-Za-z0-9_.\-[\]]{1,64}$/.test(normalized)) {
+    throw new Error(`参考图字段名不合法：${value}。只能包含字母、数字、_ - . 和 []。`);
+  }
+  return normalized;
+}
+
+function normalizeImageTransport(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return null;
+  const transport = IMAGE_TRANSPORT_ALIASES.get(raw);
+  if (!transport) {
+    throw new Error(`未知参考图传输方式：${value}。可用值：${IMAGE_TRANSPORTS.join(' / ')}`);
+  }
+  return transport;
+}
+
+function normalizeImageShape(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return null;
+  const shape = IMAGE_FIELD_SHAPE_ALIASES.get(raw);
+  if (!shape) {
+    throw new Error(`未知参考图取值形状：${value}。可用值：${IMAGE_FIELD_SHAPES.join(' / ')}`);
+  }
+  return shape;
+}
+
+/**
+ * 参考图端点。
+ *   - 没配：按传输方式推导（JSON → /images/generations，multipart → /images/edits）
+ *   - 相对路径：补上开头的 /，拼在 base_url 后面
+ *   - 完整 URL：直接使用，方便少数网关把生图和改图放在不同域名
+ */
+function resolveImageEndpoint(value, transport) {
+  const raw = String(value || '').trim();
+  if (!raw) return transport === 'multipart' ? '/images/edits' : '/images/generations';
+  if (/^https?:\/\//i.test(raw)) return raw;
+  return raw.startsWith('/') ? raw : `/${raw}`;
+}
+
+/** 只保留用户真实给出的项，null / undefined / 空串不参与合并，避免把默认值盖成空。 */
+function definedOnly(input) {
+  const result = {};
+  for (const [key, value] of Object.entries(input || {})) {
+    if (value !== undefined && value !== null && value !== '') result[key] = value;
+  }
+  return result;
+}
+
+/**
+ * 把 profile / CLI 上的图生图适配项收敛成一份确定的配置。
+ * 一个都不配时，行为和旧版完全一致（JSON + image_urls + /images/generations）。
+ *
+ * OpenAI 官方接口例外：它没有 image_urls 这回事，改图一律 /images/edits + multipart image[]，
+ * 所以带 family / apiStyle 进来时会先把这套默认垫底。
+ */
+function resolveImageOptions(input = {}, context = {}) {
+  const family = context.family ? normalizeFamily(context.family) : null;
+  const apiStyle = family && context.apiStyle ? normalizeApiStyle(context.apiStyle, family) : null;
+  const explicit = definedOnly(input);
+
+  // 用户自己指定了传输方式时，整套形状就跟着那个传输方式走，不再垫官方默认；
+  // 否则（未指定或只指定了字段名/端点）官方接口默认垫上 multipart + image。
+  const officialDefault = family === 'openai'
+    && apiStyle === 'official'
+    && !explicit.imageTransport
+    ? { imageTransport: 'multipart', imageField: 'image' }
+    : {};
+
+  const merged = { ...officialDefault, ...explicit };
+  const transport = normalizeImageTransport(merged.imageTransport) || 'json';
+  const explicitField = normalizeImageField(merged.imageField);
+  // multipart 下 OpenAI 的 /images/edits 认的是 image/image[]，不是 image_urls
+  const field = explicitField || (transport === 'multipart' ? 'image' : 'image_urls');
+  // 形状取值统一用 IMAGE_FIELD_SHAPES 里的拼写（array-object），
+  // 不要再冒出 object-array 这种第二套写法，否则 shapeImageValues 会认不出来、
+  // 把用户明确要求的对象数组静默降级成字符串数组。
+  const shape = normalizeImageShape(merged.imageShape)
+    || (OBJECT_SHAPED_FIELDS.has(field) ? 'array-object' : 'array');
+
+  return {
+    field,
+    transport,
+    shape,
+    endpoint: resolveImageEndpoint(merged.imageEndpoint, transport),
+  };
+}
+
+function shapeImageValues(images, shape) {
+  if (shape === 'single') {
+    // 单值形状装不下多张参考图，静默丢掉会让用户以为多图生效了
+    if (images.length > 1) {
+      throw new Error(
+        `参考图形状是 single（单值字段），但本次给了 ${images.length} 张参考图。`
+        + '请改用 --image-shape array（字符串数组）或 array-object（对象数组），或只传一张参考图。',
+      );
+    }
+    return images[0];
+  }
+  if (shape === 'array-object') return images.map((value) => ({ url: value }));
+  return images.slice();
+}
+
+// 兼容接口的 size 用比例。这里只拦「明显写错」的输入，
+// 不做严格白名单——不同中转站支持的比例并不一致，收得太死会误伤。
+const ASPECT_RATIO_PATTERN = /^\d+(?:\.\d+)?:\d+(?:\.\d+)?$/;
+// 4K 只在这些比例下可用，其余比例传 4k 会被上游拒或产出异常图
+const VALID_4K_SIZES = new Set(['16:9', '9:16', '2:1', '1:2', '21:9', '9:21']);
+const RESOLUTIONS = new Set(['1k', '2k', '4k']);
+
+function normalizeResolution(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return '2k';
+  if (!RESOLUTIONS.has(raw)) {
+    throw new Error(`resolution 不支持「${value}」。可用值：${[...RESOLUTIONS].join(' / ')}`);
+  }
+  return raw;
+}
+
+/**
+ * 校验 size，并兑现文档承诺的 4K 降级：
+ * 4K 遇到不支持的比例时自动降到 2k，而不是把非法组合原样发给站点。
+ */
+function resolveSizeAndResolution(sizeInput, resolutionInput, warn = () => {}) {
+  const size = String(sizeInput || '').trim();
+  if (size && size !== 'auto' && !ASPECT_RATIO_PATTERN.test(size)) {
+    throw new Error(
+      `size 不支持「${sizeInput}」。OpenAI 兼容接口用比例，例如 1:1 / 16:9 / 9:16 / 2:3；`
+      + '传像素值请改用 --api official。',
+    );
+  }
+
+  let resolution = normalizeResolution(resolutionInput);
+  const effectiveSize = size || '1:1';
+
+  if (resolution === '4k' && !VALID_4K_SIZES.has(effectiveSize)) {
+    warn(`4K 不支持比例 ${effectiveSize}，已自动降级到 2k（4K 支持：${[...VALID_4K_SIZES].join(' / ')}）。`);
+    resolution = '2k';
+  }
+
+  return { size: effectiveSize, resolution };
+}
+
+/**
  * OpenAI 兼容接口：默认协议，Gemini / Grok 的模型也走这里。
  * 请求体保持旧中转站的形状（size 用比例、resolution 用 1k/2k/4k），
  * 这样已有配置不需要改。quality / style / response_format 继续透传，
  * 因为不同中转站对这些字段的支持并不统一。
  */
 function buildOpenAiCompatibleRequest(params) {
+  const images = params.imageUrls || [];
+  const imageOptions = resolveImageOptions(params.imageOptions);
+  const { size, resolution } = resolveSizeAndResolution(params.size, params.resolution, params.warn);
   const body = {
     model: params.model,
     prompt: params.prompt,
     n: params.n === undefined ? 1 : Number(params.n),
-    size: params.size || '1:1',
-    resolution: params.resolution || '2k',
+    size,
+    resolution,
   };
 
   if (!Number.isInteger(body.n) || body.n < 1) {
     throw new Error('n 必须是大于 0 的整数。');
   }
 
-  if (params.imageUrls?.length) body.image_urls = params.imageUrls;
   if (params.quality) body.quality = params.quality;
   if (params.style) body.style = params.style;
   if (params.responseFormat) body.response_format = params.responseFormat;
   if (params.user) body.user = params.user;
 
-  return {
-    path: '/images/generations',
-    headers: { Authorization: `Bearer ${params.apiKey}` },
-    body,
-  };
+  const headers = { Authorization: `Bearer ${params.apiKey}` };
+
+  if (images.length === 0) {
+    return { path: '/images/generations', headers, body };
+  }
+
+  // multipart：参考图不进 JSON，改成文件字段，由调用方拼 body
+  if (imageOptions.transport === 'multipart') {
+    return {
+      path: imageOptions.endpoint,
+      headers,
+      body,
+      transport: 'multipart',
+      imageField: imageOptions.field,
+      imageUrls: images,
+    };
+  }
+
+  body[imageOptions.field] = shapeImageValues(images, imageOptions.shape);
+
+  return { path: imageOptions.endpoint, headers, body };
 }
 
 /** OpenAI 官方接口：只发官方字段，size 要换成像素值。 */
 function buildOpenAiOfficialRequest(params) {
   rejectUnsupported('OpenAI 官方接口', params, ['resolution', 'imageSize', 'style']);
+
+  const images = params.imageUrls || [];
+  // 官方接口没有 image_urls 这回事：改图默认走 /images/edits + multipart image[]。
+  // 用户在 imageOptions 里显式写的值仍然优先。
+  const imageOptions = resolveImageOptions(params.imageOptions, {
+    family: 'openai',
+    apiStyle: 'official',
+  });
 
   const size = params.size === undefined
     ? undefined
@@ -210,13 +430,26 @@ function buildOpenAiOfficialRequest(params) {
     body.output_compression = compression;
   }
 
-  if (params.imageUrls?.length) body.image_urls = params.imageUrls;
+  const headers = { Authorization: `Bearer ${params.apiKey}` };
 
-  return {
-    path: '/images/generations',
-    headers: { Authorization: `Bearer ${params.apiKey}` },
-    body,
-  };
+  if (images.length === 0) {
+    return { path: '/images/generations', headers, body };
+  }
+
+  if (imageOptions.transport === 'multipart') {
+    return {
+      path: imageOptions.endpoint,
+      headers,
+      body,
+      transport: 'multipart',
+      imageField: imageOptions.field,
+      imageUrls: images,
+    };
+  }
+
+  body[imageOptions.field] = shapeImageValues(images, imageOptions.shape);
+
+  return { path: imageOptions.endpoint, headers, body };
 }
 
 /** Gemini 官方接口：Interactions API。 */
@@ -381,6 +614,50 @@ function extractImages({ family, apiStyle }, result) {
   return { mode: 'sync', images: usable };
 }
 
+/**
+ * 从异步任务的轮询响应里取出**全部**图片。
+ * 早期版本只取第一张，导致 `--n 3` 的异步任务虽然付了 3 张的钱，却只落盘 1 张。
+ * 这里把站点可能用的几种形状都收一遍：result.images / result.data / 顶层 images / 递归 image block。
+ */
+function extractTaskImages(payload) {
+  const found = [];
+
+  const push = (item) => {
+    if (!item || typeof item !== 'object') return;
+    const imageUrl = item.url || item.image_url;
+    const base64 = item.b64_json || item.base64;
+    if (imageUrl || base64) {
+      found.push({ imageUrl, base64, mimeType: item.mime_type || item.mimeType });
+    }
+  };
+
+  const containers = [
+    payload?.result?.images,
+    payload?.images,
+    payload?.result?.data,
+    payload?.data,
+  ];
+
+  for (const container of containers) {
+    if (Array.isArray(container)) container.forEach(push);
+  }
+
+  // 少数站点不返回数组，直接把单张图片平铺在顶层或 result 里
+  push(payload?.result);
+  push(payload);
+
+  // 兜底：Gemini 官方那种 steps[].content[] 结构，或站点自定义的嵌套
+  for (const block of collectImageBlocks(payload?.result || payload)) {
+    found.push({
+      imageUrl: block.url,
+      base64: block.data || block.b64_json,
+      mimeType: block.mime_type,
+    });
+  }
+
+  return dedupeImages(found.filter((image) => image.imageUrl || image.base64));
+}
+
 function modelLooksLike(family, modelId) {
   const id = String(modelId || '').toLowerCase();
   if (family === 'gemini') {
@@ -437,14 +714,27 @@ function buildModelListRequest({ family, apiStyle, baseUrl, apiKey }) {
 module.exports = {
   FAMILIES,
   API_STYLES,
+  IMAGE_TRANSPORTS,
+  IMAGE_FIELD_SHAPES,
   normalizeFamily,
   normalizeApiStyle,
+  normalizeImageField,
+  normalizeImageTransport,
+  normalizeImageShape,
+  resolveImageOptions,
+  resolveImageEndpoint,
+  shapeImageValues,
   defaultBaseUrl,
   builtinModels,
   allBuiltinModels,
   defaultModel,
   buildRequest,
   extractImages,
+  extractTaskImages,
+  resolveSizeAndResolution,
+  normalizeResolution,
+  VALID_4K_SIZES,
+  OPENAI_QUALITY_VALUES: [...OPENAI_QUALITY],
   modelLooksLike,
   modelEntriesFromList,
   buildModelListRequest,

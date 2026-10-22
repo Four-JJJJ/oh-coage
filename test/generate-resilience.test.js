@@ -19,6 +19,29 @@ function createTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'oh-coage-resilience-'));
 }
 
+/**
+ * 造一个「key 读不到」的 security stub。
+ * 否则这个用例会去查开发者真实的登录钥匙串——虽然只读且不会弹窗，
+ * 但一旦本机恰好存在同名记录，断言就会随机失败。
+ */
+function createMissingKeySecurityStub(t) {
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oh-coage-nokey-'));
+  t.after(() => fs.rmSync(binDir, { recursive: true, force: true }));
+
+  const stubPath = path.join(binDir, 'security');
+  fs.writeFileSync(stubPath, [
+    '#!/bin/bash',
+    'case "$1" in',
+    '  find-generic-password) echo "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain." >&2; exit 44 ;;',
+    '  *) exit 0 ;;',
+    'esac',
+    '',
+  ].join('\n'));
+  fs.chmodSync(stubPath, 0o755);
+
+  return { env: { PATH: `${binDir}${path.delimiter}${process.env.PATH}` } };
+}
+
 function startServer(handler) {
   const server = http.createServer(handler);
 
@@ -35,10 +58,10 @@ function startServer(handler) {
   });
 }
 
-function runGenerate(args, home) {
+function runGenerate(args, home, extraEnv = {}) {
   return new Promise((resolve) => {
     // 必须摘掉 OH_COAGE_TEST，否则子进程会走测试导出分支而不执行 main()
-    const env = { ...process.env, HOME: home };
+    const env = { ...process.env, HOME: home, ...extraEnv };
     delete env.OH_COAGE_TEST;
 
     const child = spawn(process.execPath, [generatePath, ...args], {
@@ -113,7 +136,7 @@ test('pollTask retries transient query failures instead of failing the whole tas
     { data: { status: 'completed', result: { images: [{ b64_json: 'done' }] } } },
   ];
 
-  const image = await generate.pollTask('test-key', 'https://image.example/v1', 'task-1', {
+  const images = await generate.pollTask('test-key', 'https://image.example/v1', 'task-1', {
     now: () => 0,
     request: async () => {
       const next = responses.shift();
@@ -123,7 +146,7 @@ test('pollTask retries transient query failures instead of failing the whole tas
     sleep: async (ms) => { waits.push(ms); },
   });
 
-  assert.deepEqual(image, { imageUrl: undefined, base64: 'done' });
+  assert.deepEqual(images, [{ imageUrl: undefined, base64: 'done', mimeType: undefined }]);
   assert.deepEqual(waits, generate.POLL_DELAYS_MS.slice(0, 2));
 });
 
@@ -155,13 +178,13 @@ test('pollTask gives up after too many consecutive failures', async () => {
 
 test('pollTask recognizes vendor-specific terminal statuses', async () => {
   for (const status of ['succeeded', 'DONE', 'Finished']) {
-    const image = await generate.pollTask('test-key', 'https://image.example/v1', 'task-1', {
+    const images = await generate.pollTask('test-key', 'https://image.example/v1', 'task-1', {
       now: () => 0,
       request: async () => ({ data: { status, result: { images: [{ b64_json: 'ok' }] } } }),
       sleep: async () => { throw new Error(`不该 sleep（status=${status}）`); },
     });
 
-    assert.equal(image.base64, 'ok', `status=${status} 应被识别为完成`);
+    assert.equal(images[0].base64, 'ok', `status=${status} 应被识别为完成`);
   }
 });
 
@@ -177,13 +200,13 @@ test('pollTask treats canceled/error as terminal failures instead of polling to 
 });
 
 test('pollTask accepts a result delivered without any status field', async () => {
-  const image = await generate.pollTask('test-key', 'https://image.example/v1', 'task-1', {
+  const images = await generate.pollTask('test-key', 'https://image.example/v1', 'task-1', {
     now: () => 0,
     request: async () => ({ data: { url: 'https://cdn.example/a.png' } }),
     sleep: async () => { throw new Error('不该 sleep'); },
   });
 
-  assert.equal(image.imageUrl, 'https://cdn.example/a.png');
+  assert.equal(images[0].imageUrl, 'https://cdn.example/a.png');
 });
 
 test('classifyError honours the explicit fallback marker used by the Keychain path', () => {
@@ -250,7 +273,7 @@ test('a transient 5xx is retried on the same profile before giving up', async (t
     '--base-url', server.baseUrl,
     '--out-dir', tempDir,
     '--no-fallback',
-  ], home);
+  ], home, { OH_COAGE_RETRY_DELAY_MS: '0' });
 
   assert.equal(result.code, 0, result.stderr);
   assert.equal(attempts, 2, '第一次 502 后应在同一 profile 上重试');
@@ -291,7 +314,8 @@ test('a profile whose Keychain entry is missing falls back instead of aborting t
     JSON.stringify({ config_path: configPath }),
   );
 
-  const result = await runGenerate(['--prompt', 'hello'], home);
+  const stub = createMissingKeySecurityStub(t);
+  const result = await runGenerate(['--prompt', 'hello'], home, stub.env);
 
   assert.equal(result.code, 1);
   assert.match(result.stderr, /keychain/i);
@@ -341,7 +365,8 @@ test('generate warns that --api-key is visible in the process list', async (t) =
     '--prompt', 'a red apple',
     '--api-key', 'k',
     '--base-url', 'http://127.0.0.1:1/v1',
-  ], home);
+    '--no-fallback',
+  ], home, { OH_COAGE_RETRY_DELAY_MS: '0' });
 
   assert.match(result.stderr, /--api-key 的密钥会短暂出现在进程列表/);
   assert.match(result.stderr, /IMAGES2_GEN_API_KEY/);

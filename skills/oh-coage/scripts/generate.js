@@ -23,12 +23,16 @@ const { resolveModel, resolveModelForProfile } = require('./models');
 const {
   normalizeFamily,
   normalizeApiStyle,
+  normalizeImageField,
+  normalizeImageTransport,
+  normalizeImageShape,
+  resolveImageOptions,
   buildRequest,
   extractImages,
+  extractTaskImages,
   resolveEndpointBaseUrl,
 } = require('./providers');
 
-const VALID_4K_SIZES = new Set(['16:9', '9:16', '2:1', '1:2', '21:9', '9:21']);
 const REQUEST_TIMEOUT_MS = 90 * 1000;
 const POLL_TIMEOUT_MS = 20 * 1000;
 const TASK_TIMEOUT_MS = 5 * 60 * 1000;
@@ -88,7 +92,22 @@ function parseHttpStatus(error) {
   return match ? Number(match[1]) : null;
 }
 
-function classifyError(error) {
+// 这些错误说明「连接压根没建起来」，请求一定没到达服务端，重发是安全的
+const NEVER_SENT_NETWORK_ERRORS = ['econnrefused', 'enotfound', 'eai_again'];
+// 这些错误含义模糊：请求可能已经被服务端收下并处理了
+const AMBIGUOUS_NETWORK_ERRORS = ['timed out', 'timeout', 'socket hang up', 'econnreset', 'epipe'];
+
+/**
+ * 把错误归类，决定「要不要重试」和「要不要换 profile」。
+ *
+ * @param {Error} error
+ * @param {{ idempotent?: boolean }} options
+ *   idempotent=true（默认）：幂等请求（轮询用的 GET）。超时/重置可以放心重试。
+ *   idempotent=false：非幂等请求（提交生成的 POST）。超时/重置**不能**重试——
+ *     服务端可能已经收下并计费了，重发就是重复扣费。这类错误只换 profile。
+ */
+function classifyError(error, options = {}) {
+  const idempotent = options.idempotent !== false;
   const message = String(error?.message || '');
   const statusCode = parseHttpStatus(error);
   const lower = message.toLowerCase();
@@ -101,10 +120,19 @@ function classifyError(error) {
     return { kind: 'auth', statusCode, retryable: false, fallback: true };
   }
   if (statusCode && RETRYABLE_STATUS_CODES.has(statusCode)) {
+    // 服务端明确回了错误状态码，说明它知道自己失败了，重试是安全的
     return { kind: statusCode === 429 ? 'rate_limit' : 'upstream', statusCode, retryable: true, fallback: true };
   }
-  if (lower.includes('timed out') || lower.includes('timeout') || lower.includes('socket hang up') || lower.includes('econnreset') || lower.includes('econnrefused') || lower.includes('enotfound')) {
+
+  const neverSent = NEVER_SENT_NETWORK_ERRORS.some((token) => lower.includes(token));
+  if (neverSent) {
     return { kind: 'network', statusCode, retryable: true, fallback: true };
+  }
+
+  const ambiguous = AMBIGUOUS_NETWORK_ERRORS.some((token) => lower.includes(token));
+  if (ambiguous) {
+    // 非幂等请求遇到含义模糊的网络错误：不重发，只换 profile
+    return { kind: 'network', statusCode, retryable: idempotent, fallback: true };
   }
 
   return { kind: 'unknown', statusCode, retryable: false, fallback: false };
@@ -161,16 +189,42 @@ function extractImagePayload(result) {
   return { imageUrl, base64 };
 }
 
-async function submitGeneration({ apiKey, baseUrl, family, apiStyle, params }) {
-  const requestSpec = buildRequest({ family, apiStyle, ...params, apiKey });
+async function submitGeneration({ apiKey, baseUrl, family, apiStyle, imageOptions, params }) {
+  const requestSpec = buildRequest({ family, apiStyle, ...params, apiKey, imageOptions });
   const endpointBase = resolveEndpointBaseUrl({ family, apiStyle, baseUrl });
-  const result = await request(`${endpointBase}${requestSpec.path}`, {
+  let url;
+  if (/^https?:\/\//i.test(requestSpec.path)) {
+    // 允许跨域端点（少数网关把生图和改图放在不同域名），但要把 key 的去向说清楚。
+    // 否则一个写错的 --image-endpoint 就会把 Authorization 静默发到任意主机。
+    const target = new URL(requestSpec.path);
+    const origin = new URL(endpointBase);
+    if (target.origin !== origin.origin) {
+      process.stderr.write(
+        `警告：本次请求发往 ${target.origin}，与 profile 的 base_url (${origin.origin}) 不同，`
+        + 'API Key 会一并发送到该地址。请确认它可信。\n',
+      );
+    }
+    url = requestSpec.path;
+  } else {
+    url = `${endpointBase}${requestSpec.path}`;
+  }
+
+  let contentType = 'application/json';
+  let payload = JSON.stringify(requestSpec.body);
+
+  if (requestSpec.transport === 'multipart') {
+    const multipart = buildMultipartBody(requestSpec);
+    contentType = multipart.contentType;
+    payload = multipart.payload;
+  }
+
+  const result = await request(url, {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
+      'Content-Type': contentType,
       ...requestSpec.headers,
     },
-  }, JSON.stringify(requestSpec.body), REQUEST_TIMEOUT_MS);
+  }, payload, REQUEST_TIMEOUT_MS);
 
   const extracted = extractImages({ family, apiStyle }, result);
   if (extracted.mode === 'async' || extracted.images.length > 0) {
@@ -178,19 +232,6 @@ async function submitGeneration({ apiKey, baseUrl, family, apiStyle, params }) {
   }
 
   throw new Error(`无法识别生成接口返回结构: ${truncateForLog(JSON.stringify(result), MAX_ERROR_SNIPPET)}`);
-}
-
-/**
- * 轮询响应里的图片可能藏在 {result: {...}} 里，也可能就直接铺在顶层。
- * 两种形状都试一遍，避免因为站点风格不同而误报「找不到图片结果」。
- */
-function extractTaskImage(payload) {
-  const fromResult = extractImagePayload({ data: { result: payload?.result } });
-  if (fromResult.imageUrl || fromResult.base64) {
-    return fromResult;
-  }
-
-  return extractImagePayload({ data: payload });
 }
 
 function pollDelayForAttempt(attemptIndex) {
@@ -223,7 +264,8 @@ async function pollTask(apiKey, baseUrl, taskId, options = {}) {
 
       consecutiveFailures = 0;
     } catch (error) {
-      const classification = classifyError(error);
+      // 轮询是幂等 GET，超时/重置都可以放心重试
+      const classification = classifyError(error, { idempotent: true });
       consecutiveFailures += 1;
 
       if (!classification.retryable || consecutiveFailures > MAX_POLL_FAILURES) {
@@ -242,9 +284,9 @@ async function pollTask(apiKey, baseUrl, taskId, options = {}) {
     const normalizedStatus = String(payload.status || '').toLowerCase();
 
     if (COMPLETED_TASK_STATUSES.has(normalizedStatus)) {
-      const image = extractTaskImage(payload);
-      if (image.imageUrl || image.base64) {
-        return image;
+      const images = extractTaskImages(payload);
+      if (images.length > 0) {
+        return images;
       }
       throw new Error('任务已完成，但未找到图片结果');
     }
@@ -255,9 +297,9 @@ async function pollTask(apiKey, baseUrl, taskId, options = {}) {
 
     // 少数站点不返回 status，直接把结果放在轮询响应里
     if (!normalizedStatus) {
-      const image = extractTaskImage(payload);
-      if (image.imageUrl || image.base64) {
-        return image;
+      const images = extractTaskImages(payload);
+      if (images.length > 0) {
+        return images;
       }
     }
 
@@ -302,6 +344,69 @@ function inferExtensionFromUrl(url) {
 
 function looksLikeRemoteImageReference(value) {
   return /^https?:\/\//i.test(value) || /^data:image\//i.test(value);
+}
+
+/** 把 data URI 拆成可上传的文件字段；multipart 不能直接塞 data URI 字符串。 */
+function dataUriToUpload(value) {
+  const match = String(value || '').match(/^data:([^;,]+)(?:;[^,]*)?;base64,([\s\S]+)$/i);
+  if (!match) return null;
+
+  const mimeType = match[1].toLowerCase();
+  const extension = [...IMAGE_MIME_TYPES.entries()].find(([, mime]) => mime === mimeType)?.[0] || '.png';
+  return {
+    mimeType,
+    extension,
+    buffer: Buffer.from(match[2], 'base64'),
+  };
+}
+
+/**
+ * 拼 multipart/form-data 请求体。
+ * 参考图字段按 OpenAI /images/edits 的习惯写成 `image[]`（多张）或 `image`（单张），
+ * 其余标量字段照旧平铺成普通表单字段。
+ */
+function buildMultipartBody(requestSpec) {
+  const boundary = `----ohcoage${crypto.randomBytes(12).toString('hex')}`;
+  const chunks = [];
+
+  const pushField = (name, value) => {
+    chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`));
+  };
+
+  for (const [name, value] of Object.entries(requestSpec.body || {})) {
+    if (value === undefined || value === null) continue;
+    // 数组和对象在表单里没有标准表示，按 JSON 字符串发，和多数中转站一致
+    pushField(name, typeof value === 'object' ? JSON.stringify(value) : String(value));
+  }
+
+  const images = requestSpec.imageUrls || [];
+  const fieldName = requestSpec.imageField || 'image';
+  images.forEach((reference, index) => {
+    const upload = dataUriToUpload(reference);
+    if (!upload) {
+      throw new Error(
+        'multipart 图生图只能上传本地图片或 data URI。'
+        + `当前第 ${index + 1} 张参考图是远程 URL，请先下载到本地，或改用 --image-transport json。`,
+      );
+    }
+
+    // 多张时用 image[]，单张时用 image：OpenAI 官方两种都认，其他站点也更宽容
+    const name = images.length > 1 ? `${fieldName}[]` : fieldName;
+    chunks.push(Buffer.from(
+      `--${boundary}\r\n`
+      + `Content-Disposition: form-data; name="${name}"; filename="reference-${index + 1}${upload.extension}"\r\n`
+      + `Content-Type: ${upload.mimeType}\r\n\r\n`,
+    ));
+    chunks.push(upload.buffer);
+    chunks.push(Buffer.from('\r\n'));
+  });
+
+  chunks.push(Buffer.from(`--${boundary}--\r\n`));
+
+  return {
+    contentType: `multipart/form-data; boundary=${boundary}`,
+    payload: Buffer.concat(chunks),
+  };
 }
 
 function imageFileToDataUri(filePath) {
@@ -351,10 +456,13 @@ function formatTimestampForDir(date = new Date()) {
 function buildOutputPath(output, extension, runDir, index = 0) {
   if (output) {
     ensureDir(path.dirname(output));
-    // 多图时第 1 张用用户指定文件名，后续追加序号，避免互相覆盖
-    if (index === 0) return output;
     const ext = path.extname(output);
-    return `${output.slice(0, -ext.length || undefined)}-${index + 1}${ext}`;
+    // 用户没写扩展名时补上，否则会产出没有后缀、双击打不开的文件
+    const base = ext ? output.slice(0, -ext.length) : output;
+    const suffix = ext || extension;
+    // 多图时第 1 张用用户指定文件名，后续追加序号，避免互相覆盖
+    if (index === 0) return `${base}${suffix}`;
+    return `${base}-${index + 1}${suffix}`;
   }
 
   ensureDir(runDir);
@@ -479,14 +587,71 @@ function downloadToFile(url, filePath, redirectsLeft = MAX_REDIRECTS) {
   });
 }
 
+/**
+ * 时间戳目录只精确到秒，同一秒内的两个并发 run 会撞进同一个目录，
+ * 后写入的 meta.json 会覆盖前一个。目录已存在时追加序号，保证互不干扰。
+ */
 function buildRunDir(rootOutputDir, timestamp) {
-  return path.join(rootOutputDir, formatTimestampForDir(timestamp));
+  const base = path.join(rootOutputDir, formatTimestampForDir(timestamp));
+  ensureDir(rootOutputDir);
+
+  // 用 mkdir 的原子性抢占目录：目录已存在时 mkdirSync 抛 EEXIST。
+  // 不能用 existsSync 判断完再创建——两个并发进程之间存在空窗，会抢到同一个目录，
+  // 结果后写入的 meta.json 覆盖前一个。
+  for (let counter = 0; counter < 1000; counter += 1) {
+    const candidate = counter === 0 ? base : `${base}-${counter}`;
+    try {
+      fs.mkdirSync(candidate);
+      return candidate;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+  }
+
+  throw new Error(`无法为本次生成创建独立的输出目录（已尝试 1000 个序号）：${base}`);
 }
 
 function writeRunMeta(runDir, meta) {
   if (!runDir) return;
   ensureDir(runDir);
   fs.writeFileSync(path.join(runDir, 'meta.json'), `${JSON.stringify(meta, null, 2)}\n`);
+}
+
+/**
+ * 按文件头判断是不是真图片。
+ * 站点的错误页、限流 JSON、登录跳转页都可能带着 200 返回，
+ * 不校验就会把 HTML 存成 .png，还对外报 success。
+ */
+function looksLikeImageBuffer(buffer) {
+  if (!buffer || buffer.length < 12) return false;
+  // PNG: 89 50 4E 47
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) return true;
+  // JPEG: FF D8 FF
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return true;
+  // WEBP: RIFF....WEBP
+  if (buffer.subarray(0, 4).toString('ascii') === 'RIFF'
+    && buffer.subarray(8, 12).toString('ascii') === 'WEBP') return true;
+  // GIF: GIF87a / GIF89a
+  if (buffer.subarray(0, 3).toString('ascii') === 'GIF') return true;
+  return false;
+}
+
+/** 从磁盘上已有的文件做同样的魔数校验。 */
+function assertFileIsImage(filePath, sourceLabel) {
+  let buffer;
+  try {
+    buffer = fs.readFileSync(filePath);
+  } catch (error) {
+    throw new Error(`无法读取${sourceLabel}：${error.message}`);
+  }
+
+  if (!looksLikeImageBuffer(buffer)) {
+    const preview = buffer.subarray(0, 80).toString('utf8').replace(/\s+/g, ' ').trim();
+    throw new Error(
+      `${sourceLabel}不是有效图片（内容开头：${preview || '空'}）。`
+      + '通常是站点返回了错误页或限流响应，请检查 base_url / API Key / 配额。',
+    );
+  }
 }
 
 async function saveImage(image, output, runDir, index = 0) {
@@ -501,8 +666,15 @@ async function saveImage(image, output, runDir, index = 0) {
       throw new Error('base64 图片格式不合法');
     }
 
+    const buffer = Buffer.from(encoded, 'base64');
+    if (!looksLikeImageBuffer(buffer)) {
+      throw new Error(
+        `接口返回的 base64 数据不是有效图片（开头：${buffer.subarray(0, 80).toString('utf8').replace(/\s+/g, ' ').trim() || '空'}）。`,
+      );
+    }
+
     const filePath = buildOutputPath(output, inferExtension(meta, dataUri), runDir, index);
-    fs.writeFileSync(filePath, Buffer.from(encoded, 'base64'));
+    fs.writeFileSync(filePath, buffer);
     return filePath;
   }
 
@@ -510,7 +682,27 @@ async function saveImage(image, output, runDir, index = 0) {
     // 先按 URL 猜扩展名落到磁盘，下载后再按响应头纠正
     const guessedExtension = inferExtensionFromUrl(image.imageUrl) || '.png';
     const filePath = buildOutputPath(output, guessedExtension, runDir, index);
-    const contentType = await downloadToFile(image.imageUrl, filePath);
+
+    let contentType;
+    try {
+      contentType = await downloadToFile(image.imageUrl, filePath);
+    } catch (downloadError) {
+      fs.rmSync(filePath, { force: true });
+      // 图片其实已经生成、钱已经花掉了，只是下载没成功。
+      // 这里必须标记成「不可重试、但可以换 profile」：重试提交等于重复计费。
+      throw markFallback(
+        new Error(`图片已生成但下载失败（不会重试提交，避免重复计费）：${downloadError.message}`),
+        'download',
+      );
+    }
+
+    // 下载回来的是 HTML 错误页时，不要当成图片留在磁盘上
+    try {
+      assertFileIsImage(filePath, '下载到的内容');
+    } catch (invalidError) {
+      fs.rmSync(filePath, { force: true });
+      throw markFallback(invalidError, 'download');
+    }
 
     if (!output) {
       const actualExtension = inferExtensionFromContentType(contentType);
@@ -561,6 +753,10 @@ function parseArgs() {
       case '--response-format': parsed.responseFormat = value(i++, '--response-format'); break;
       case '--user': parsed.user = value(i++, '--user'); break;
       case '--image-url': parsed.imageUrls.push(value(i++, '--image-url')); break;
+      case '--image-field': parsed.imageField = value(i++, '--image-field'); break;
+      case '--image-transport': parsed.imageTransport = value(i++, '--image-transport'); break;
+      case '--image-shape': parsed.imageShape = value(i++, '--image-shape'); break;
+      case '--image-endpoint': parsed.imageEndpoint = value(i++, '--image-endpoint'); break;
       case '--base-url': parsed.baseUrl = value(i++, '--base-url'); break;
       case '--api-key': parsed.apiKey = value(i++, '--api-key'); break;
       case '--output': parsed.output = path.resolve(value(i++, '--output')); break;
@@ -572,7 +768,8 @@ function parseArgs() {
   }
 
   if (!parsed.prompt) {
-    console.error('用法: node generate.js --prompt "提示词" [--family openai|gemini|grok] [--api openai|official] [--model NAME] [--profile NAME] [--size SIZE] [--resolution 1k|2k|4k] [--image-size 512|1K|2K|4K] [--n COUNT] [--quality QUALITY] [--style STYLE] [--background auto] [--output-format png] [--output-compression 0-100] [--moderation auto] [--response-format url|b64_json] [--user USER] [--image-url URL] [--base-url URL] [--api-key KEY] [--output FILE | --out-dir DIR] [--json] [--no-fallback]');
+    console.error('用法: node generate.js --prompt "提示词" [--family openai|gemini|grok] [--api openai|official] [--model NAME] [--profile NAME] [--size SIZE] [--resolution 1k|2k|4k] [--image-size 512|1K|2K|4K] [--n COUNT] [--quality QUALITY] [--style STYLE] [--background auto] [--output-format png] [--output-compression 0-100] [--moderation auto] [--response-format url|b64_json] [--user USER] [--image-url URL] [--image-field FIELD] [--image-transport json|multipart] [--image-shape array|array-object|single] [--image-endpoint PATH] [--base-url URL] [--api-key KEY] [--output FILE | --out-dir DIR] [--json] [--no-fallback]');
+    console.error('图生图适配：--image-field 指定参考图字段名（默认 image_urls，multipart 默认 image）；--image-transport multipart 会把参考图作为文件字段上传；--image-endpoint 覆盖默认的 /images/generations 或 /images/edits。');
     process.exit(1);
   }
 
@@ -637,6 +834,15 @@ function resolveRuntimeConfig(cli) {
     }
   };
 
+  // 图生图适配项：CLI 显式值 > profile 配置 > 内置默认。
+  // 这里只合并原始值，真正的校验放到候选循环里，写错的 profile 会被跳过而不是拖垮整轮。
+  const mergeImageOptions = (profile) => ({
+    imageField: cli.imageField || profile?.image_field || null,
+    imageTransport: cli.imageTransport || profile?.image_transport || null,
+    imageShape: cli.imageShape || profile?.image_shape || null,
+    imageEndpoint: cli.imageEndpoint || profile?.image_endpoint || null,
+  });
+
   // 只传 --api-key 时，优先继承当前活跃 profile 的地址/模型族/协议，
   // 否则会回落到 DEFAULT_BASE_URL 那个示例域名，把请求发错地方。
   const fallbackProfileName = explicitProfile || activeProfileName;
@@ -644,15 +850,19 @@ function resolveRuntimeConfig(cli) {
   const manualFamily = cliFamily || (baseProfileConfig ? profileFamily(baseProfileConfig) : 'openai');
   const manualApiStyle = cliApiStyle || (baseProfileConfig ? profileApiStyle(baseProfileConfig, manualFamily) : 'openai');
 
-  const manualCandidate = cli.apiKey ? [{
+  // 环境变量 IMAGES2_GEN_API_KEY 单独给出时也要能跑（文档承诺支持 CI 注入）。
+  // 早期这里只判断 cli.apiKey，导致纯环境变量路径永远进不来。
+  const manualApiKey = cli.apiKey || process.env.IMAGES2_GEN_API_KEY;
+  const manualCandidate = manualApiKey ? [{
     name: explicitProfile || 'manual',
-    apiKey: cli.apiKey || process.env.IMAGES2_GEN_API_KEY,
+    apiKey: manualApiKey,
     baseUrl: normalizeBaseUrl(cli.baseUrl || process.env.IMAGES2_GEN_BASE_URL || baseProfileConfig?.base_url || DEFAULT_BASE_URL),
     rootOutputDir: cli.outDir ? path.resolve(cli.outDir) : null,
     outputOverride: cli.output || null,
     modelInput: baseProfileConfig?.model || null,
     family: manualFamily,
     apiStyle: manualApiStyle,
+    imageOptions: mergeImageOptions(baseProfileConfig),
     source: cli.apiKey ? 'cli' : 'env',
   }] : [];
 
@@ -669,6 +879,7 @@ function resolveRuntimeConfig(cli) {
       // 这里用 profile 自己声明的族，--family 只用来过滤，不拿来改 profile 的身份
       family: declaredFamily,
       apiStyle: cliApiStyle || profileApiStyle(profile, declaredFamily),
+      imageOptions: mergeImageOptions(profile),
       source: 'profile',
     };
   });
@@ -700,7 +911,9 @@ function resolveRuntimeConfig(cli) {
   }
 
   // --model 是本次全局指定的，先解析一次：写错了就直接报错，不在每个候选上重复失败
-  const cliModelEntry = cli.model ? resolveModel(cli.model, config?.custom_models, cliFamily) : null;
+  // 传完整 config，否则 --sync-models 拉回来的 discovered_models 在这里查不到，
+  // 用户照着文档用 --model <拉到的ID> 会被判成「未知模型」。
+  const cliModelEntry = cli.model ? resolveModel(cli.model, config, cliFamily) : null;
 
   // base_url 不合法（拼错、用了非 http/https 协议）或固定了未知模型的 profile
   // 直接跳过，不拖垮整轮 fallback
@@ -757,10 +970,49 @@ function writeRunLog(record) {
   appendJsonl(RUNS_PATH, record);
 }
 
+// 重试退避时长。测试里用 OH_COAGE_RETRY_DELAY_MS 归零，避免端到端用例真的等 1 秒
+// （那会让测试变慢、且依赖真实定时器，是最容易 flaky 的一类）。
+const RETRY_DELAY_BASE_OVERRIDE = process.env.OH_COAGE_RETRY_DELAY_MS === undefined
+  ? null
+  : Number(process.env.OH_COAGE_RETRY_DELAY_MS);
 const RETRY_DELAY_MS = { rate_limit: 1500, network: 1000, upstream: 1000 };
 
-async function runCandidate(candidate, cli, runRecord) {
+function retryDelayFor(kind, attemptIndex) {
+  if (RETRY_DELAY_BASE_OVERRIDE !== null && Number.isFinite(RETRY_DELAY_BASE_OVERRIDE)) {
+    return Math.max(0, RETRY_DELAY_BASE_OVERRIDE);
+  }
+  return (RETRY_DELAY_MS[kind] || 1000) * attemptIndex;
+}
+
+/** 把图生图适配项写成一行，供日志和 stderr 提示使用。 */
+function describeImageOptions(imageOptions, context = {}) {
+  const resolved = resolveImageOptions(imageOptions, context);
+  const shapeLabel = resolved.shape === 'array'
+    ? '字符串数组'
+    : resolved.shape === 'array-object' ? '对象数组' : '单值';
+  return `端点=${resolved.endpoint}, 传输=${resolved.transport}, 字段=${resolved.field}, 形状=${shapeLabel}`;
+}
+
+async function runCandidate(candidate, cli, runRecord, options = {}) {
+  const sleepFn = options.sleep || sleep;
   const attemptStartedAt = new Date();
+
+  // 图生图适配项可能在 profile 里写错（例如 image_field 含空格）。
+  // 这种情况只说明「这一个 profile 不可用」，应该跳过它继续 fallback，
+  // 而不是在构造 attempt 时抛错、把整轮拖垮。
+  let imageOptionsLabel = null;
+  if (cli.imageUrls.length > 0) {
+    try {
+      imageOptionsLabel = describeImageOptions(
+        candidate.imageOptions,
+        { family: candidate.family, apiStyle: candidate.apiStyle },
+      );
+    } catch (error) {
+      process.stderr.write(`跳过 profile=${candidate.name}：${error.message.split('\n')[0]}\n`);
+      throw markFallback(error, 'config');
+    }
+  }
+
   const attempt = {
     profile: candidate.name,
     base_url: candidate.baseUrl,
@@ -769,6 +1021,8 @@ async function runCandidate(candidate, cli, runRecord) {
     model: candidate.model.model,
     model_key: candidate.model.key,
     model_source: candidate.model.source,
+    // 图生图适配信息按候选记入 attempt，日后排查 400 能看出当时用的字段名/传输方式
+    image_options: imageOptionsLabel,
     started_at: attemptStartedAt.toISOString(),
   };
 
@@ -793,7 +1047,8 @@ async function runCandidate(candidate, cli, runRecord) {
     process.stderr.write(`提示：当前使用默认模型 ${candidate.model.model}，可用 setup.js --model 切换。\n`);
   }
   if (cli.imageUrls.length > 0) {
-    process.stderr.write(`参考图片: ${cli.imageUrls.length} 张\n`);
+    // 图生图时把适配结果说清楚，否则用户遇到 400 很难判断是字段名还是传输方式不对
+    process.stderr.write(`参考图片: ${cli.imageUrls.length} 张；适配: ${imageOptionsLabel}\n`);
   }
 
   const params = {
@@ -812,6 +1067,8 @@ async function runCandidate(candidate, cli, runRecord) {
     responseFormat: cli.responseFormat,
     user: cli.user,
     imageUrls: cli.imageUrls,
+    // 让 providers 层能把「4K 已降级到 2k」这类调整回传给用户
+    warn: (message) => process.stderr.write(`${message}\n`),
   };
 
   let lastError = null;
@@ -823,6 +1080,7 @@ async function runCandidate(candidate, cli, runRecord) {
         baseUrl: candidate.baseUrl,
         family: candidate.family,
         apiStyle: candidate.apiStyle,
+        imageOptions: candidate.imageOptions,
         params,
       });
       attempt.response_mode = submitted.mode;
@@ -831,7 +1089,10 @@ async function runCandidate(candidate, cli, runRecord) {
       if (submitted.mode === 'async') {
         attempt.task_id = submitted.taskId;
         process.stderr.write(`任务已提交: ${submitted.taskId}\n`);
-        images = [await pollTask(candidateApiKey, candidate.baseUrl, submitted.taskId)];
+        // pollTask 现在返回全部图片：异步任务也可能一次产出多张，
+        // 只取第一张会让用户白付其余几张的钱。
+        images = await pollTask(candidateApiKey, candidate.baseUrl, submitted.taskId);
+        process.stderr.write(`任务回收完成，拿到 ${images.length} 张图片\n`);
       } else {
         process.stderr.write(`接口直接返回了 ${submitted.images.length} 张图片\n`);
         images = submitted.images;
@@ -882,13 +1143,16 @@ async function runCandidate(candidate, cli, runRecord) {
         results,
         task_id: attempt.task_id || null,
         image_url_count: cli.imageUrls.length,
+        image_options: imageOptionsLabel,
       });
 
       runRecord.attempts.push(attempt);
       return { attempt, savedPath, savedPaths, runDir, images, results };
     } catch (error) {
       lastError = error;
-      const classification = classifyError(error);
+      // 这里是提交（非幂等 POST）。超时/连接重置时服务端可能已经生成并计费，
+      // 所以只对「确定没送达」和「服务端明确报错」的情况重试，其余直接换 profile。
+      const classification = classifyError(error, { idempotent: false });
       attempt.status = 'failed';
       attempt.last_error = truncateForLog(error.message, MAX_LOG_ERROR_LENGTH);
       attempt.error_kind = classification.kind;
@@ -896,12 +1160,13 @@ async function runCandidate(candidate, cli, runRecord) {
       attempt.completed_at = new Date().toISOString();
       attempt.duration_ms = Date.now() - attemptStartedAt.getTime();
 
-      // retryable 覆盖限流、网络抖动和 5xx 上游故障，统一在同 profile 上退避重试一次
+      // retryable 覆盖限流、明确失败的上游故障，以及「连接根本没建起来」的网络错误，
+      // 统一在同 profile 上退避重试一次
       if (classification.retryable && index < MAX_RETRY_ATTEMPTS) {
-        const delay = (RETRY_DELAY_MS[classification.kind] || 1000) * index;
+        const delay = retryDelayFor(classification.kind, index);
         const status = classification.statusCode ? ` ${classification.statusCode}` : '';
         process.stderr.write(`遇到 ${classification.kind}${status}，${delay}ms 后重试当前 profile...\n`);
-        await sleep(delay);
+        await sleepFn(delay);
         continue;
       }
 
@@ -917,6 +1182,17 @@ async function main() {
   const cli = parseArgs();
   if (cli.apiKey) {
     process.stderr.write('提示：--api-key 的密钥会短暂出现在进程列表（ps 可见）。介意请改用 IMAGES2_GEN_API_KEY 环境变量。\n');
+  }
+  // CLI 上的图生图适配项先验一遍，拼错时立刻报错而不是等每个候选都失败
+  cli.imageOptions = {
+    imageField: normalizeImageField(cli.imageField),
+    imageTransport: normalizeImageTransport(cli.imageTransport),
+    imageShape: normalizeImageShape(cli.imageShape),
+    imageEndpoint: cli.imageEndpoint || null,
+  };
+  if (cli.imageUrls.length === 0
+    && (cli.imageField || cli.imageTransport || cli.imageShape || cli.imageEndpoint)) {
+    process.stderr.write('提示：没有提供 --image-url，本次是文生图，参考图适配项不会生效。\n');
   }
   cli.imageUrls = normalizeImageReferences(cli.imageUrls);
   const runtime = resolveRuntimeConfig(cli);
@@ -1026,6 +1302,7 @@ if (process.env.OH_COAGE_TEST === '1') {
     MAX_POLL_FAILURES,
     pollDelayForAttempt,
     pollTask,
+    runCandidate,
     classifyError,
     truncateForLog,
     inferExtensionFromUrl,

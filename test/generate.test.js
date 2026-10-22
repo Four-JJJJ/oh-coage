@@ -9,9 +9,9 @@ const test = require('node:test');
 const repoRoot = path.resolve(__dirname, '..');
 const generatePath = path.join(repoRoot, 'skills', 'oh-coage', 'scripts', 'generate.js');
 
-function createTempDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'oh-coage-test-'));
-}
+const { tempDir, startServer: sharedStartServer } = require('./helpers');
+
+const createTempDir = () => tempDir(null, 'oh-coage-test-');
 
 function writeTinyPng(filePath) {
   const pngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
@@ -66,6 +66,20 @@ function runGenerate(args) {
     child.stderr.on('data', (chunk) => { stderr += chunk; });
     child.on('close', (code) => resolve({ code, stdout, stderr }));
   });
+}
+
+/** 以测试模式加载 generate.js，拿到可单测的内部函数。 */
+function loadGenerateForTest() {
+  const previousTestFlag = process.env.OH_COAGE_TEST;
+  process.env.OH_COAGE_TEST = '1';
+  delete require.cache[require.resolve('../skills/oh-coage/scripts/generate')];
+  const mod = require('../skills/oh-coage/scripts/generate');
+  if (previousTestFlag === undefined) {
+    delete process.env.OH_COAGE_TEST;
+  } else {
+    process.env.OH_COAGE_TEST = previousTestFlag;
+  }
+  return mod;
 }
 
 test('generate uploads local image-url paths as base64 data URIs', async (t) => {
@@ -142,7 +156,7 @@ test('pollTask uses an increasing recovery schedule for async image tasks', asyn
     { data: { status: 'completed', result: { images: [{ b64_json: 'abc123' }] } } },
   ];
 
-  const image = await pollTask('test-key', 'https://image.example/v1', 'task-123', {
+  const images = await pollTask('test-key', 'https://image.example/v1', 'task-123', {
     now: (() => {
       let current = 0;
       return () => current += 1;
@@ -161,5 +175,49 @@ test('pollTask uses an increasing recovery schedule for async image tasks', asyn
     'https://image.example/v1/tasks/task-123',
     'https://image.example/v1/tasks/task-123',
   ]);
-  assert.deepEqual(image, { imageUrl: undefined, base64: 'abc123' });
+  assert.deepEqual(images, [{ imageUrl: undefined, base64: 'abc123', mimeType: undefined }]);
+});
+
+test('pollTask returns every image an async task produced, not just the first', async () => {
+  // 异步任务也可能一次产出多张图；只取第一张会让用户白付其余几张的钱
+  const images = await loadGenerateForTest().pollTask('test-key', 'https://image.example/v1', 'task-multi', {
+    now: () => 0,
+    request: async () => ({
+      data: {
+        status: 'completed',
+        result: {
+          images: [
+            { url: 'https://cdn.example/a.png' },
+            { url: 'https://cdn.example/b.png' },
+            { url: 'https://cdn.example/c.png' },
+          ],
+        },
+      },
+    }),
+    sleep: async () => { throw new Error('不该 sleep'); },
+  });
+
+  assert.equal(images.length, 3, '三张图都应被回收');
+  assert.deepEqual(images.map((image) => image.imageUrl), [
+    'https://cdn.example/a.png',
+    'https://cdn.example/b.png',
+    'https://cdn.example/c.png',
+  ]);
+});
+
+test('pollTask keeps every image when the payload mixes base64 and url entries', async () => {
+  const images = await loadGenerateForTest().pollTask('test-key', 'https://image.example/v1', 'task-mixed', {
+    now: () => 0,
+    request: async () => ({
+      data: {
+        status: 'done',
+        result: { data: [{ b64_json: 'aaa' }, { url: 'https://cdn.example/b.png' }] },
+      },
+    }),
+    sleep: async () => { throw new Error('不该 sleep'); },
+  });
+
+  assert.equal(images.length, 2);
+  assert.equal(images[0].base64, 'aaa');
+  assert.equal(images[1].imageUrl, 'https://cdn.example/b.png');
 });

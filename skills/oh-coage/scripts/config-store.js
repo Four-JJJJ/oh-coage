@@ -63,13 +63,22 @@ function ensureParentDir(filePath) {
   ensureDir(dir, dir === APP_DIR ? 0o700 : undefined);
 }
 
+/**
+ * APP_DIR 里的文件（state / runs）含本机路径和完整 prompt，收紧到 0600。
+ * 其他目录下的配置文件（用户自己的项目目录）保持系统默认，不擅自改。
+ */
+function privateModeFor(filePath) {
+  return path.dirname(path.resolve(filePath)) === APP_DIR ? 0o600 : undefined;
+}
+
 function writeJson(filePath, value) {
   ensureParentDir(filePath);
 
   // 原子写：先落临时文件再 rename，避免写到一半崩溃留下半个 JSON 把配置整个弄坏
   const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   try {
-    fs.writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`);
+    const mode = privateModeFor(filePath);
+    fs.writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, mode ? { mode } : undefined);
     fs.renameSync(tempPath, filePath);
   } catch (error) {
     fs.rmSync(tempPath, { force: true });
@@ -79,7 +88,8 @@ function writeJson(filePath, value) {
 
 function appendJsonl(filePath, value) {
   ensureParentDir(filePath);
-  fs.appendFileSync(filePath, `${JSON.stringify(value)}\n`);
+  const mode = privateModeFor(filePath);
+  fs.appendFileSync(filePath, `${JSON.stringify(value)}\n`, mode ? { mode } : undefined);
 }
 
 function loadState() {
@@ -135,6 +145,51 @@ function loadActiveConfig() {
   return { state, config: loadConfigFromPath(configPath), configPath };
 }
 
+/**
+ * 对某个配置文件加互斥锁，避免两个 agent 同时改配置时互相覆盖（lost update）。
+ * 锁文件放在同目录，用 O_EXCL 保证只有一个进程能创建成功；
+ * 进程异常退出留下的陈旧锁会按 mtime 超时回收，不会把用户永久锁死。
+ */
+const LOCK_STALE_MS = 30 * 1000;
+const LOCK_RETRY_MS = 50;
+const LOCK_MAX_WAIT_MS = 10 * 1000;
+
+function acquireConfigLock(configPath) {
+  const lockPath = `${path.resolve(configPath)}.lock`;
+  const startedAt = Date.now();
+
+  for (;;) {
+    try {
+      const fd = fs.openSync(lockPath, 'wx');
+      fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+      fs.closeSync(fd);
+      return () => fs.rmSync(lockPath, { force: true });
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+
+      // 陈旧锁回收：持锁进程已经死了，或者锁存在太久
+      try {
+        const stat = fs.statSync(lockPath);
+        if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+          fs.rmSync(lockPath, { force: true });
+          continue;
+        }
+      } catch {
+        continue;
+      }
+
+      if (Date.now() - startedAt > LOCK_MAX_WAIT_MS) {
+        throw new Error(
+          `配置文件正被另一个进程占用（${lockPath}）。请等它结束后重试；`
+          + `如果确认没有其他 oh-coage 进程在跑，可手动删除该 .lock 文件。`,
+        );
+      }
+
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LOCK_RETRY_MS);
+    }
+  }
+}
+
 function saveConfig(configPath, config) {
   // resolved_root_output_dir 是按配置文件所在位置算出来的派生值，绝不能落盘：
   // 配置文件一旦被搬动（典型场景是放进 iCloud 同步到另一台机器），
@@ -149,7 +204,12 @@ function saveConfig(configPath, config) {
     ),
   };
 
-  writeJson(configPath, persisted);
+  const release = acquireConfigLock(configPath);
+  try {
+    writeJson(configPath, persisted);
+  } finally {
+    release();
+  }
 }
 
 function buildKeychainAccount(profileName, configPath) {
@@ -281,6 +341,7 @@ module.exports = {
   loadActiveConfig,
   resolveProfileOutputDir,
   saveConfig,
+  acquireConfigLock,
   buildKeychainAccount,
   saveKeychainSecret,
   readKeychainSecret,

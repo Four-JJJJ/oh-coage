@@ -39,7 +39,10 @@ const {
   FAMILIES,
   normalizeFamily,
   normalizeApiStyle,
-  defaultBaseUrl,
+  normalizeImageField,
+  normalizeImageTransport,
+  normalizeImageShape,
+  resolveImageOptions,
   modelEntriesFromList,
   buildModelListRequest,
 } = require('./providers');
@@ -92,6 +95,11 @@ function parseArgs() {
         parsed.profileModel = value;
         break;
       }
+      case '--image-field': parsed.imageField = args[++i]; break;
+      case '--image-transport': parsed.imageTransport = args[++i]; break;
+      case '--image-shape': parsed.imageShape = args[++i]; break;
+      case '--image-endpoint': parsed.imageEndpoint = args[++i]; break;
+      case '--clear-image-options': parsed.clearImageOptions = true; break;
     }
   }
 
@@ -128,6 +136,10 @@ function printUsage() {
   console.error('    node setup.js --profile-model "image-2.5-flare" [--profile "main"]');
   console.error('  取消固定，让它跟随全局当前模型:');
   console.error('    node setup.js --profile-model none [--profile "main"]');
+  console.error('  配置图生图适配（不写 --profile 则作用于当前 profile）:');
+  console.error('    node setup.js --image-transport json|multipart [--image-field image_urls] [--image-shape array|array-object|single] [--image-endpoint /images/edits] [--profile "main"]');
+  console.error('  清除图生图适配，回到内置默认:');
+  console.error('    node setup.js --clear-image-options [--profile "main"]');
 }
 
 function requireConfig() {
@@ -161,6 +173,24 @@ function describeProfile(profile) {
   return `${family} / ${apiLabel}`;
 }
 
+/** profile 是否写了图生图适配项（写了才在 --list 里显示，避免默认配置变啰嗦）。 */
+function hasImageOptions(profile) {
+  return Boolean(profile?.image_field || profile?.image_transport || profile?.image_shape || profile?.image_endpoint);
+}
+
+function describeImageOptions(profile) {
+  const resolved = resolveImageOptions({
+    imageField: profile?.image_field,
+    imageTransport: profile?.image_transport,
+    imageShape: profile?.image_shape,
+    imageEndpoint: profile?.image_endpoint,
+  });
+  const shapeLabel = resolved.shape === 'array'
+    ? '字符串数组'
+    : resolved.shape === 'array-object' ? '对象数组' : '单值';
+  return `端点=${resolved.endpoint}, 传输=${resolved.transport}, 字段=${resolved.field}, 形状=${shapeLabel}`;
+}
+
 function listProfiles() {
   const { config, configPath } = loadActiveConfig();
   if (!config) {
@@ -176,7 +206,8 @@ function listProfiles() {
     const syncedNote = Array.isArray(profile.synced_models) && profile.synced_models.length
       ? ` [synced: ${profile.synced_models.length}]`
       : '';
-    console.log(`${flag} ${name} (${describeProfile(profile)}) -> ${profile.base_url} -> ${profile.root_output_dir || profile.output_dir}${modelNote}${syncedNote}`);
+    const imageNote = hasImageOptions(profile) ? ` [图生图: ${describeImageOptions(profile)}]` : '';
+    console.log(`${flag} ${name} (${describeProfile(profile)}) -> ${profile.base_url} -> ${profile.root_output_dir || profile.output_dir}${modelNote}${syncedNote}${imageNote}`);
   });
 }
 
@@ -294,8 +325,10 @@ async function healthCheck(options) {
   const names = Object.keys(config.profiles || {});
   if (!names.length) {
     console.log('没有可检查的 profile。');
-    return;
+    return [];
   }
+
+  const unhealthyProfiles = [];
 
   for (const name of names) {
     const profile = config.profiles[name];
@@ -357,12 +390,21 @@ async function healthCheck(options) {
     checks.push({ item: 'interface', ok: true, detail: describeProfile(profile) });
 
     const healthy = checks.every((check) => check.ok);
+    if (!healthy) unhealthyProfiles.push(name);
     const activeFlag = name === config.active_profile ? '*' : ' ';
     console.log(`${activeFlag} ${name}: ${healthy ? 'ok' : 'needs_attention'}`);
     checks.forEach((check) => {
       console.log(`  - ${check.item}: ${check.ok ? 'ok' : 'fail'} (${check.detail})`);
     });
   }
+
+  // 退出码要能反映健康状态，否则 CI 里 --health-check 永远「通过」
+  if (unhealthyProfiles.length > 0) {
+    console.log(`\n有 ${unhealthyProfiles.length} 个 profile 需要处理: ${unhealthyProfiles.join(', ')}`);
+    process.exitCode = 1;
+  }
+
+  return unhealthyProfiles;
 }
 
 function activateProfile(profileName) {
@@ -374,7 +416,8 @@ function activateProfile(profileName) {
 
 function listModels() {
   const { config } = loadActiveConfig();
-  const catalog = buildModelCatalog(config?.custom_models);
+  // 传完整 config：只传 custom_models 会把 --sync-models 拉回来的 discovered_models 漏掉
+  const catalog = buildModelCatalog(config);
   const current = resolveConfiguredModel(config);
 
   console.log(`current_model: ${current.key} -> ${current.model}`);
@@ -523,6 +566,62 @@ function setProfileModel(options) {
 }
 
 /**
+ * 图生图适配：不同站点的参考图字段名/传输方式不一样，做成 profile 级配置。
+ * 全部留空就等于内置默认（JSON + image_urls + /images/generations）。
+ */
+function setProfileImageOptions(options) {
+  const { config, configPath } = requireConfig();
+  const targetName = options.profile || config.active_profile;
+  const profile = config.profiles?.[targetName];
+
+  if (!profile) {
+    throw new Error(`profile 不存在: ${targetName}`);
+  }
+
+  if (options.clearImageOptions) {
+    for (const key of ['image_field', 'image_transport', 'image_shape', 'image_endpoint']) {
+      delete profile[key];
+    }
+    profile.updated_at = new Date().toISOString();
+    config.updated_at = profile.updated_at;
+    saveConfig(configPath, config);
+    console.log(`已清除 profile ${targetName} 的图生图适配，回到内置默认：${describeImageOptions(profile)}`);
+    return;
+  }
+
+  // 先全部验一遍再落盘，避免写进一半合法一半非法的配置
+  const next = {
+    image_field: options.imageField !== undefined
+      ? normalizeImageField(options.imageField)
+      : profile.image_field,
+    image_transport: options.imageTransport !== undefined
+      ? normalizeImageTransport(options.imageTransport)
+      : profile.image_transport,
+    image_shape: options.imageShape !== undefined
+      ? normalizeImageShape(options.imageShape)
+      : profile.image_shape,
+    image_endpoint: options.imageEndpoint !== undefined
+      ? options.imageEndpoint
+      : profile.image_endpoint,
+  };
+
+  // 只覆写本次显式给出的项，其余保持原样
+  for (const [key, value] of Object.entries(next)) {
+    if (value === undefined || value === null || value === '') {
+      delete profile[key];
+    } else {
+      profile[key] = value;
+    }
+  }
+
+  profile.updated_at = new Date().toISOString();
+  config.updated_at = profile.updated_at;
+  saveConfig(configPath, config);
+
+  console.log(`已更新 profile ${targetName} 的图生图适配: ${describeImageOptions(profile)}`);
+}
+
+/**
  * 是否给出了初始化参数，用来区分「切换模型」和「初始化顺带指定模型」。
  * 注意不含 --profile：它既能当初始化参数，也能给 --profile-model 指定目标，
  * 单独出现时不足以说明用户想初始化。
@@ -532,11 +631,29 @@ function isInitRequest(options) {
   return Boolean(options.baseUrl || options.apiKey);
 }
 
+/**
+ * profile 名会进 Keychain account、配置文件 key 和 --list 输出，
+ * 带路径分隔符或控制字符的名字没有意义，还容易在日志/命令拼接里出问题。
+ */
+function validateProfileName(name) {
+  if (!name) {
+    throw new Error('profile 名称不能为空。');
+  }
+  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(name)) {
+    throw new Error(
+      `profile 名称不合法：${name}。只能包含字母、数字、下划线、点和短横线，长度 1-64。`,
+    );
+  }
+  return name;
+}
+
 function upsertProfile(options) {
   if (!options.profile || !options.baseUrl || !options.apiKey) {
     printUsage();
     process.exit(1);
   }
+
+  validateProfileName(options.profile);
 
   // 默认全部走 OpenAI 兼容接口，官方接口必须显式指定
   const family = options.family ? normalizeFamily(options.family) : 'openai';
@@ -581,6 +698,16 @@ function upsertProfile(options) {
     updated_at: new Date().toISOString(),
   };
 
+  // 初始化时可以顺带把图生图适配项定下来，省得用户再跑一次 setup
+  const imageOptionKeys = ['imageField', 'imageTransport', 'imageShape', 'imageEndpoint'];
+  if (imageOptionKeys.some((key) => options[key] !== undefined)) {
+    const target = config.profiles[options.profile];
+    if (options.imageField !== undefined) target.image_field = normalizeImageField(options.imageField);
+    if (options.imageTransport !== undefined) target.image_transport = normalizeImageTransport(options.imageTransport);
+    if (options.imageShape !== undefined) target.image_shape = normalizeImageShape(options.imageShape);
+    if (options.imageEndpoint !== undefined) target.image_endpoint = options.imageEndpoint;
+  }
+
   // 初始化时可以直接给这个 profile 固定模型
   if (options.profileModel && !isClearModelInput(options.profileModel)) {
     config.profiles[options.profile].model = resolveModel(options.profileModel, config, family).key;
@@ -601,6 +728,9 @@ function upsertProfile(options) {
   console.log(`root_output_dir: ${config.profiles[options.profile].root_output_dir}${options.outputDir ? '' : '（未指定，已自动推导）'}`);
   console.log(`active_profile: ${config.active_profile}`);
   console.log(`profile_model: ${config.profiles[options.profile].model || '（跟随全局）'}`);
+  if (hasImageOptions(config.profiles[options.profile])) {
+    console.log(`图生图适配: ${describeImageOptions(config.profiles[options.profile])}`);
+  }
 }
 
 function deleteProfile(profileName) {
@@ -638,6 +768,8 @@ function renameProfile(oldName, newName) {
     printUsage();
     process.exit(1);
   }
+
+  validateProfileName(newName);
 
   const { config, configPath } = requireConfig();
   const profile = config.profiles?.[oldName];
@@ -747,6 +879,14 @@ function main() {
     return;
   }
 
+  // 图生图适配是纯本地配置，不触发初始化，也不要求 --base-url/--api-key
+  const imageOptionFlags = [options.imageField, options.imageTransport, options.imageShape, options.imageEndpoint];
+  const wantsImageOptions = options.clearImageOptions || imageOptionFlags.some((value) => value !== undefined);
+  if (wantsImageOptions && !isInitRequest(options)) {
+    setProfileImageOptions(options);
+    return;
+  }
+
   if (options.activateProfile) {
     activateProfile(options.activateProfile);
     return;
@@ -771,7 +911,9 @@ function main() {
     return healthCheck(options);
   }
 
-  if (options.syncModels) {
+  // 只有「纯 --sync-models」才在这里直接跑；带初始化参数时要先 upsert profile，
+  // 否则 syncProfileModels 里的 requireConfig() 会报「尚未初始化」，profile 根本建不出来。
+  if (options.syncModels && !isInitRequest(options)) {
     return syncProfileModels(options.profile);
   }
 

@@ -62,7 +62,21 @@ function modelEntries(record, source) {
  * family 有值时才展开该族的内置模型、自定义模型和拉取结果。
  */
 function buildModelCatalog(configOrCustomModels, family) {
-  const config = configOrCustomModels && (configOrCustomModels.custom_models || configOrCustomModels.discovered_models)
+  // 判断传进来的是「完整配置」还是「裸的 custom_models 映射」。
+  // 早期只看 custom_models / discovered_models 是否存在，导致全新配置（这两个键都还没建）
+  // 会把 version / created_at / active_profile / current_model 这些元数据当成自定义模型，
+  // 进而让 `setup.js --model created_at` 把 current_model 永久写成时间戳。
+  // 改为看配置的特征键：profiles / current_model 只可能出现在完整配置里。
+  const isConfigObject = Boolean(configOrCustomModels)
+    && typeof configOrCustomModels === 'object'
+    && !Array.isArray(configOrCustomModels)
+    && (
+      'profiles' in configOrCustomModels
+      || 'current_model' in configOrCustomModels
+      || 'custom_models' in configOrCustomModels
+      || 'discovered_models' in configOrCustomModels
+    );
+  const config = isConfigObject
     ? configOrCustomModels
     : { custom_models: configOrCustomModels };
   const scopedFamily = family ? normalizeFamily(family) : null;

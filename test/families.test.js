@@ -54,13 +54,13 @@ function createSecurityStub(t) {
   return { binDir, env: { PATH: `${binDir}${path.delimiter}${process.env.PATH}` } };
 }
 
-function runNode(scriptPath, args, home, extraEnv = {}) {
+function runNode(scriptPath, args, home, extraEnv = {}, cwd = repoRoot) {
   return new Promise((resolve) => {
     const env = { ...process.env, HOME: home, ...extraEnv };
     delete env.OH_COAGE_TEST;
 
     const child = spawn(process.execPath, [scriptPath, ...args], {
-      cwd: repoRoot,
+      cwd,
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -462,15 +462,23 @@ test('setup --model resolves family short names against the active profile famil
 
 test('setup works without --output-dir and derives a default directory', async (t) => {
   const home = createTempDir();
+  // 关键：必须在一个临时 cwd 里跑。
+  // setup.js 不带 --output-dir 时会用 process.cwd() 推导目录，
+  // 若 cwd 是仓库根，就会把 oh-coage-config.json 写到仓库里，
+  // 覆盖开发者本机的真实配置（该文件被 .gitignore 忽略，git 层面无感）。
+  const workDir = createTempDir();
   const stub = createSecurityStub(t);
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(workDir, { recursive: true, force: true });
+  });
 
   const result = await runNode(setupPath, [
     '--profile', 'main',
     '--base-url', 'https://example.com/v1',
     '--api-key', 'k',
     '--activate',
-  ], home, stub.env);
+  ], home, stub.env, workDir);
 
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /已自动推导/);

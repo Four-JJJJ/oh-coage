@@ -8,15 +8,15 @@ const test = require('node:test');
 const repoRoot = path.resolve(__dirname, '..');
 const setupPath = path.join(repoRoot, 'skills', 'oh-coage', 'scripts', 'setup.js');
 
-function createTempDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'oh-coage-setup-'));
-}
+const { tempDir, securityStub } = require('./helpers');
 
-function runSetup(args, home) {
+const createTempDir = () => tempDir(null, 'oh-coage-setup-');
+
+function runSetup(args, home, extraEnv = {}) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [setupPath, ...args], {
       cwd: repoRoot,
-      env: { ...process.env, HOME: home },
+      env: { ...process.env, HOME: home, ...extraEnv },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -26,6 +26,15 @@ function runSetup(args, home) {
     child.stderr.on('data', (chunk) => { stderr += chunk; });
     child.on('close', (code) => resolve({ code, stdout, stderr }));
   });
+}
+
+/**
+ * 造一个假的 security 命令并排到 PATH 最前。
+ * 这样测试既能完整跑 Keychain 流程，又不会去碰真实钥匙串、不会弹授权窗。
+ */
+function createSecurityStub(home, options = {}) {
+  // 复用公共实现，避免各文件各写一份、签名漂移
+  return securityStub(null, options);
 }
 
 // 这两条都在写入 Keychain 之前就被拦下，所以测试不会碰到真实钥匙串
@@ -125,6 +134,9 @@ test('--health-check does not create the output directory as a side effect', asy
   const home = createTempDir();
   const configDir = createTempDir();
   const outputDir = path.join(configDir, 'not-yet-created');
+  // 用 stub 顶掉真实 security，否则这条用例会去查真实 Keychain，
+  // 在没登录桌面会话的环境里必然失败，而它想验的是「不创建目录」。
+  const stub = createSecurityStub(home);
   t.after(() => {
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(configDir, { recursive: true, force: true });
@@ -146,9 +158,42 @@ test('--health-check does not create the output directory as a side effect', asy
   fs.mkdirSync(path.join(home, '.oh-coage'), { recursive: true });
   fs.writeFileSync(path.join(home, '.oh-coage', 'state.json'), JSON.stringify({ config_path: configPath }));
 
-  const result = await runSetup(['--health-check'], home);
+  const result = await runSetup(['--health-check'], home, stub.env);
 
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /尚不存在，首次生成时自动创建/);
   assert.equal(fs.existsSync(outputDir), false, 'health-check 不应创建输出目录');
+});
+
+test('--health-check exits non-zero when a profile is unhealthy', async (t) => {
+  const home = createTempDir();
+  const configDir = createTempDir();
+  t.after(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  });
+
+  const configPath = path.join(configDir, 'oh-coage-config.json');
+  fs.writeFileSync(configPath, JSON.stringify({
+    version: 1,
+    active_profile: 'main',
+    current_model: 'image-2',
+    profiles: {
+      main: {
+        base_url: 'not-a-valid-url',
+        root_output_dir: configDir,
+        keychain_account: 'main:x',
+      },
+    },
+  }, null, 2));
+  fs.mkdirSync(path.join(home, '.oh-coage'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.oh-coage', 'state.json'), JSON.stringify({ config_path: configPath }));
+
+  // 用一个「key 读不到」的 stub，让 keychain 这一项确定失败，
+  // 不依赖开发者本机真实钥匙串里有没有同名记录。
+  const stub = createSecurityStub(home, { missingKey: true });
+  const result = await runSetup(['--health-check'], home, stub.env);
+
+  assert.equal(result.code, 1, '有不健康的 profile 时退出码应为 1，否则 CI 无法据此判失败');
+  assert.match(result.stdout, /needs_attention/);
 });
