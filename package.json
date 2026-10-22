@@ -9,7 +9,7 @@
   "scripts": {
     "test": "node --test",
     "test:regressions": "node --test test/regressions.test.js",
-    "coverage": "node --test --experimental-test-coverage --test-coverage-lines=88 --test-coverage-branches=65 --test-coverage-functions=90",
+    "coverage": "node --test --experimental-test-coverage --test-coverage-exclude='test/**' --test-coverage-lines=88 --test-coverage-branches=65 --test-coverage-functions=90",
     "check": "node --check skills/oh-coage/scripts/config-store.js && node --check skills/oh-coage/scripts/models.js && node --check skills/oh-coage/scripts/providers.js && node --check skills/oh-coage/scripts/setup.js && node --check skills/oh-coage/scripts/generate.js && node --check skills/oh-coage/scripts/resolve-output-dir.js"
   }
 }
