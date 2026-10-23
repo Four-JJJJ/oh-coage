@@ -113,7 +113,7 @@ codex plugin add oh-coage@oh-coage
 `--ref main` 跟随最新提交。如果你想要可复现的稳定版本，改用已发布的 tag（版本号见 [Releases](https://github.com/Four-JJJJ/oh-coage/releases)）：
 
 ```bash
-codex plugin marketplace add Four-JJJJ/oh-coage --ref v0.8.0
+codex plugin marketplace add Four-JJJJ/oh-coage --ref v0.9.0
 codex plugin add oh-coage@oh-coage
 ```
 
@@ -1069,7 +1069,7 @@ node "$SKILL_DIR/scripts/setup.js" \
 
 ```bash
 npm run check            # 6 个脚本的语法检查
-npm test                 # 全部测试（node --test，141 项）
+npm test                 # 全部测试（node --test，148 项）
 npm run test:regressions # 只跑已修缺陷的回归用例
 npm run coverage         # 覆盖率 + 门槛校验
 ```
