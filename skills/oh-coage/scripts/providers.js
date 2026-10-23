@@ -316,7 +316,7 @@ function normalizeResolution(value) {
 
 /**
  * 校验 size，并兑现文档承诺的 4K 降级：
- * 4K 遇到不支持的比例时自动降到 2k，而不是把非法组合原样发给站点。
+ * Reject unsupported combinations before submission so requested quality stays explicit.
  */
 function resolveSizeAndResolution(sizeInput, resolutionInput, warn = () => {}) {
   const size = String(sizeInput || '').trim();
@@ -331,8 +331,7 @@ function resolveSizeAndResolution(sizeInput, resolutionInput, warn = () => {}) {
   const effectiveSize = size || '1:1';
 
   if (resolution === '4k' && !VALID_4K_SIZES.has(effectiveSize)) {
-    warn(`4K 不支持比例 ${effectiveSize}，已自动降级到 2k（4K 支持：${[...VALID_4K_SIZES].join(' / ')}）。`);
-    resolution = '2k';
+    throw new Error(`4K 不支持比例 ${effectiveSize}。请选择 ${[...VALID_4K_SIZES].join(' / ')}，或明确改用 2k 后重试；本次未提交。`);
   }
 
   return { size: effectiveSize, resolution };

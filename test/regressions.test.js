@@ -71,7 +71,7 @@ test('a failed image download does not re-submit the paid generation request', a
   assert.match(result.stderr, /不会重试提交/);
 });
 
-test('a download failure is classified as fallback but not retryable', async () => {
+test('a download failure prevents both retries and profile fallback', async () => {
   const previousTestFlag = process.env.OH_COAGE_TEST;
   process.env.OH_COAGE_TEST = '1';
   delete require.cache[require.resolve(generatePath)];
@@ -88,7 +88,7 @@ test('a download failure is classified as fallback but not retryable', async () 
 
   const classification = generate.classifyError(error);
   assert.equal(classification.retryable, false, '不能重试，否则重复计费');
-  assert.equal(classification.fallback, true, '但仍应允许换下一个 profile');
+  assert.equal(classification.fallback, false, '换站点也会重新计费，必须停止');
 });
 
 // ---------------------------------------------------------------------------
@@ -381,22 +381,8 @@ test('single shape with multiple references fails loudly', () => {
 // 参数校验：4K 降级与非法取值
 // ---------------------------------------------------------------------------
 
-test('4K with an unsupported aspect ratio downgrades to 2k and says so', () => {
-  const warnings = [];
-  const spec = buildRequest({
-    family: 'openai',
-    apiStyle: 'openai',
-    model: 'gpt-image-2',
-    prompt: 'x',
-    size: '1:1',
-    resolution: '4k',
-    warn: (message) => warnings.push(message),
-  });
-
-  assert.equal(spec.body.resolution, '2k', '1:1 不支持 4K，应降级到 2k');
-  assert.equal(spec.body.size, '1:1');
-  assert.equal(warnings.length, 1, '降级必须告知用户');
-  assert.match(warnings[0], /降级到 2k/);
+test('4K with an unsupported aspect ratio asks for an explicit parameter choice', () => {
+  assert.throws(() => buildRequest({ family: 'openai', apiStyle: 'openai', prompt: 'cat', model: 'gpt-image-2', size: '1:1', resolution: '4k' }), /4K|4k/);
 });
 
 test('4K with a supported ratio is left alone', () => {
@@ -771,6 +757,7 @@ test('a profile with a malformed image_field is skipped instead of killing the r
 
   const result = await runNode(generatePath, [
     '--prompt', 'cat',
+    '--allow-profile-fallback',
     '--image-url', inputPath,
     '--out-dir', outputDir,
     '--json',
@@ -815,9 +802,8 @@ test('a non-idempotent submit is not retried when the connection is reset', asyn
   assert.equal(posts, 1, '连接被重置时不应重发非幂等的生成请求（会重复计费）');
 });
 
-test('a server-side 5xx on submit is still retried (it did not do the work)', async (t) => {
-  // 服务端明确回了 5xx，说明它知道自己失败、没产出图片，重试是安全的。
-  // 这条用例防止「为了防重复计费把重试全关掉」的过度修正。
+test('a server-side 5xx on submit pauses because billing outcome is uncertain', async (t) => {
+  // 网关错误不能证明上游没有完成或计费。
   const home = createTempDir();
   const outputDir = createTempDir();
   t.after(() => {
@@ -852,8 +838,8 @@ test('a server-side 5xx on submit is still retried (it did not do the work)', as
     '--no-fallback',
   ], { home, env: { OH_COAGE_RETRY_DELAY_MS: '0' } });
 
-  assert.equal(result.code, 0, result.stderr);
-  assert.equal(posts, 2, '明确失败的 5xx 应重试一次');
+  assert.equal(result.code, 1, result.stderr);
+  assert.equal(posts, 1, '结果不明确的 5xx 不应重试');
 });
 
 test('gemini endpoint base url is rewritten between official and compatible paths', () => {
@@ -942,7 +928,7 @@ test('profile priority controls the fallback order', async (t) => {
     const match = req.url.match(/^\/([a-z]+)\/v1\/images\/generations/);
     if (match) {
       order.push(match[1]);
-      res.writeHead(500, { 'content-type': 'application/json' });
+      res.writeHead(401, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ error: 'down' }));
     }
     res.writeHead(404);
@@ -964,30 +950,29 @@ test('profile priority controls the fallback order', async (t) => {
     },
   }, outputDir);
 
-  // --no-fallback：只跑第一个候选（active profile 优先于 priority），
-  // 但同一 profile 上的 5xx 仍会退避重试一次，所以是 2 次请求、1 个 profile。
+  // --no-fallback 只跑当前配置。
   await runNode(generatePath, [
     '--prompt', 'cat',
     '--out-dir', outputDir,
     '--no-fallback',
   ], { home, env: { ...stub.env, OH_COAGE_RETRY_DELAY_MS: '0' } });
 
-  assert.equal(order.length, 2, '--no-fallback 下只尝试一个 profile（含一次重试）');
+  assert.equal(order.length, 1, '--no-fallback 下只尝试一个 profile');
 
-  // 不禁用 fallback：三个 profile 各尝试 2 次（1 次 + 1 次重试），
-  // 且顺序必须是 active(mid) -> priority 10(first) -> priority 30(last)。
+  // 显式开启跨配置兜底后按当前配置和 priority 顺序尝试。
   order.length = 0;
   await runNode(generatePath, [
     '--prompt', 'cat',
     '--out-dir', outputDir,
+    '--allow-profile-fallback',
   ], { home, env: { ...stub.env, OH_COAGE_RETRY_DELAY_MS: '0' } });
 
-  assert.equal(order.length, 6, '不禁用 fallback 时应依次尝试三个 profile');
+  assert.equal(order.length, 3, '显式允许跨配置兜底时依次尝试三个配置');
 
   // 每个 profile 各出现两次（一次原始 + 一次重试），
   // 顺序应为 active(mid) -> priority 10(first) -> priority 30(last)
   assert.deepEqual(
-    [order[0], order[2], order[4]],
+    order,
     ['mid', 'zzz', 'aaa'],
     `fallback 顺序应为 active -> priority 10(zzz) -> priority 30(aaa)，实际 ${order.join(',')}`,
   );
@@ -1115,7 +1100,7 @@ test('--delete-profile removes the profile and repoints the active one', async (
   assert.equal(saved.active_profile, 'spare', '删掉 active profile 后应自动指向剩下的一个');
 });
 
-test('the last remaining profile cannot be deleted', async (t) => {
+test('deleting the last profile returns to initialization and preserves output files', async (t) => {
   const home = createTempDir();
   const outputDir = createTempDir();
   const stub = createSecurityStub(t);
@@ -1133,8 +1118,14 @@ test('the last remaining profile cannot be deleted', async (t) => {
     },
   }, outputDir);
 
+  const imagePath = path.join(outputDir, 'existing.png');
+  fs.writeFileSync(imagePath, Buffer.from(PNG_BASE64, 'base64'));
   const result = await runNode(setupPath, ['--delete-profile', 'only'], { home, env: stub.env });
 
-  assert.notEqual(result.code, 0);
-  assert.match(result.stderr, /最后一个 profile/);
+  assert.equal(result.code, 0, result.stderr);
+  const config = JSON.parse(fs.readFileSync(path.join(outputDir, 'oh-coage-config.json'), 'utf8'));
+  assert.deepEqual(config.profiles, {});
+  assert.ok(!config.active_profile);
+  assert.ok(fs.existsSync(imagePath));
+  assert.ok(fs.existsSync(path.join(home, '.oh-coage', 'state.json')));
 });

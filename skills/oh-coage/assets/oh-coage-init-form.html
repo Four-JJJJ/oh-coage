@@ -1,182 +1,96 @@
-<style>
-#oh-coage-init-form {
-  max-width: 680px;
-}
-
-#oh-coage-init-form .init-header {
-  margin-bottom: 20px;
-}
-
-#oh-coage-init-form .init-header h2 {
-  margin: 0;
-}
-
-#oh-coage-init-form .init-header p {
-  margin: 8px 0 0;
-}
-
-#oh-coage-init-form .init-fields {
-  display: grid;
-  gap: 20px;
-}
-
-#oh-coage-init-form .init-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 20px;
-}
-
-#oh-coage-init-form .init-field {
-  display: grid;
-  gap: 8px;
-}
-
-#oh-coage-init-form .init-path-meta {
-  margin: 8px 0 0;
-}
-
-#oh-coage-init-form .init-actions {
-  display: grid;
-  gap: 8px;
-  margin-top: 20px;
-}
-
-#oh-coage-init-form [hidden] {
-  display: none !important;
-}
-
-@media (max-width: 560px) {
-  #oh-coage-init-form .init-grid {
-    grid-template-columns: 1fr;
-  }
-}
-</style>
-
-<div id="oh-coage-init-form" class="card" data-has-project="false">
-  <form id="oh-coage-init-form-fields">
-    <div class="init-header">
-      <h2>初始化 oh-coage</h2>
-      <p class="text-muted">配置一次后，图片会自动保存到默认目录。</p>
-    </div>
-
-    <div class="init-fields">
-      <label class="form-label init-field">
-        图片保存目录
-        <input class="form-control" name="outputDir" type="text" placeholder="可不填，自动使用当前项目目录或桌面" autocomplete="off">
-        <span id="oh-coage-output-dir-hint" class="init-path-meta text-small text-muted"></span>
-      </label>
-
-      <label id="oh-coage-project-option" class="form-check" hidden>
-        <input id="oh-coage-use-project-dir" class="form-check-input" name="useProjectDir" type="checkbox" value="true" checked>
-        <span class="form-check-label">保存在项目文件夹内</span>
-      </label>
-
-      <div class="init-grid">
-        <label class="form-label init-field">
-          Profile 名称
-          <input class="form-control" name="profile" type="text" value="default" autocomplete="off" required>
-        </label>
-        <label class="form-label init-field">
-          生图站点 URL
-        <input class="form-control" name="baseUrl" type="url" placeholder="https://example.com/v1" autocomplete="url" required>
-        </label>
-        <label class="form-label init-field">
-          API Key
-          <input class="form-control" name="apiKey" type="password" autocomplete="new-password" required>
-        </label>
-        <label class="form-label init-field">
-          模型族
-          <select class="form-control" name="family">
-            <option value="openai" selected>openai · GPT Image</option>
-            <option value="gemini">gemini · Nano Banana</option>
-            <option value="grok">grok · Grok Imagine</option>
-          </select>
-          <span class="text-small text-muted">只决定用哪家的模型，默认都走下面的接口。</span>
-        </label>
-        <label class="form-label init-field">
-          接口协议
-          <select class="form-control" name="api">
-            <option value="openai" selected>OpenAI 兼容接口（默认，推荐）</option>
-            <option value="official">官方接口（仅限该家原生协议）</option>
-          </select>
-          <span class="text-small text-muted">不确定就保持默认；之后可用 setup.js 或 generate.js --api 切换。</span>
-        </label>
-        <label class="form-label init-field">
-          默认模型
-          <select class="form-control" name="model">
-            <option value="image-2" selected>image-2 · gpt-image-2（默认）</option>
-            <option value="image-2.5-sunburst">image-2.5-sunburst · gpt-image-2.5-sunburst</option>
-            <option value="image-2.5-flare">image-2.5-flare · gpt-image-2.5-flare</option>
-            <option value="banana-2.1">banana-2.1 · gemini-nano-banana-2.1</option>
-            <option value="banana-pro">banana-pro · gemini-3-pro-image</option>
-            <option value="grok-imagine-2">grok-imagine-2 · grok-imagine-image-2.0</option>
-          </select>
-          <span class="text-small text-muted">之后可用 setup.js --model 随时切换。</span>
-        </label>
-      </div>
-    </div>
-
-    <div class="init-actions">
-      <p class="text-small text-muted">API Key 不会写入普通配置文件，也不会保存在表单浏览器中；提交后会进入当前 task 的初始化消息，并由本机脚本写入 Keychain。</p>
-      <button id="oh-coage-init-form-submit" class="btn btn-primary btn-block" type="button">保存并初始化</button>
-      <p id="oh-coage-init-form-status" class="text-small" role="status" aria-live="polite"></p>
-    </div>
+<div id="oh-coage-init-form" class="card">
+  <h2>连接你的生图服务</h2>
+  <p class="text-muted">第 1 步 / 共 2 步 · 填写服务地址和 API Key，连接成功后，就可以选择你想使用的模型。</p>
+  <form id="oh-coage-connection-fields">
+    <label class="form-label">配置名称
+      <input class="form-control" name="profile" value="" required autocomplete="off" placeholder="例如：日常创作">
+    </label>
+    <label class="form-label">服务地址
+      <input class="form-control" name="baseUrl" type="url" required autocomplete="off" placeholder="https://example.com/v1">
+    </label>
+    <label class="form-label">API Key
+      <input class="form-control" name="apiKey" type="password" required autocomplete="off" placeholder="粘贴此服务的 API Key">
+    </label>
+    <details>
+      <summary>更多设置（可选）</summary>
+      <label class="form-label">图片保存目录<input class="form-control" name="outputDir" placeholder="留空，自动使用项目目录或桌面"></label>
+      <label class="form-label">生图请求协议<select class="form-select" name="api"><option value="openai" selected>OpenAI 生图请求格式（默认）</option><option value="official">其他原生协议</option></select></label>
+      <label class="form-label" id="oh-coage-official-family" hidden>原生协议对应厂家<select name="officialFamily"><option value="">请选择原生协议对应厂家</option><option value="openai">OpenAI</option><option value="gemini">Gemini</option><option value="grok">Grok</option></select></label>
+      <p class="text-small text-muted">默认按 OpenAI Images 生图请求发送到你填写的站点；Gemini、Grok 等厂家模型也可通过支持该格式的兼容站点使用。只有需要厂家原生协议时才切换，并选择对应厂家。原生协议配置一次对应一个厂家；想在同一站点混用不同厂家模型，请保持默认格式。</p>
+      <label class="form-label">手动模型 ID（仅列表接口不可用时）<textarea class="form-control" name="manualModelIds" rows="3" placeholder="每行填写一个服务商提供的准确模型 ID"></textarea></label>
+      <p class="text-small text-muted">通常留空。手动配置不会验证连接鉴权和出图能力；请勿填写猜测的模型名称。</p>
+    </details>
+    <p class="text-small text-muted">API Key 将通过当前对话交给本机脚本，保存在本机钥匙串中。连接验证只读取模型列表，不生成图片。</p>
+    <div class="viz-row"><button class="btn btn-primary" type="submit">验证连接</button><button class="btn" type="button" id="oh-coage-init-cancel">暂时跳过</button></div>
+    <p role="status" aria-live="polite"></p>
   </form>
 </div>
-
+<style>
+#oh-coage-init-form { min-width: 0; overflow-wrap: anywhere; }
+#oh-coage-init-form input:not([type="checkbox"]), #oh-coage-init-form select, #oh-coage-init-form textarea { box-sizing: border-box; width: 100%; min-width: 0; }
+#oh-coage-init-form form { display: grid; gap: 20px; }
+#oh-coage-init-form .form-label { display: grid; gap: 8px; }
+#oh-coage-init-form details .form-label { margin-top: 12px; }
+</style>
 <script>
 (() => {
+  const data = /*CONNECTION_DATA*/null;
   const root = document.getElementById('oh-coage-init-form');
-  const form = document.getElementById('oh-coage-init-form-fields');
-  const outputDir = form?.querySelector('[name="outputDir"]');
-  const outputDirHint = document.getElementById('oh-coage-output-dir-hint');
-  const projectOption = document.getElementById('oh-coage-project-option');
-  const useProjectDir = document.getElementById('oh-coage-use-project-dir');
-  const submitButton = document.getElementById('oh-coage-init-form-submit');
-  const status = document.getElementById('oh-coage-init-form-status');
-
-  if (!root || !form || !outputDir || !outputDirHint || !projectOption || !useProjectDir || !submitButton || !status) return;
-
-  const hasProject = root.dataset.hasProject === 'true';
-  projectOption.hidden = !hasProject;
-  useProjectDir.checked = hasProject;
-  useProjectDir.disabled = !hasProject;
-  outputDirHint.textContent = hasProject
-    ? '可不填，默认保存在项目文件夹内；也可以直接修改路径。'
-    : '可不填，默认保存在桌面；也可以直接输入其他路径。';
-
-  submitButton.addEventListener('click', async () => {
+  const form = root.querySelector('form');
+  const button = form.querySelector('button');
+  const status = form.querySelector('[role="status"]');
+  if (data) {
+    for (const name of ['profile', 'baseUrl', 'outputDir', 'api']) form.elements[name].value = data[name] || '';
+    if (data.editProfile) {
+      form.elements.profile.readOnly = true;
+      form.elements.apiKey.required = false;
+      form.elements.apiKey.placeholder = '地址不变时可留空；更改地址请填写对应 API Key';
+      form.elements.baseUrl.addEventListener('input', () => {
+        const changed = form.elements.baseUrl.value.trim().replace(/\/+$/, '') !== data.baseUrl.replace(/\/+$/, '');
+        form.elements.apiKey.required = changed;
+        status.textContent = changed ? '服务地址已更改，请填写新服务的 API Key。' : '';
+      });
+    }
+  }
+  document.getElementById('oh-coage-init-cancel').addEventListener('click', async () => {
+    form.elements.apiKey.value = '';
+    try {
+      if (typeof window.openai?.sendFollowUpMessage !== 'function') throw new Error('bridge');
+      await window.openai.sendFollowUpMessage({ title: '退出生图设置', prompt: 'OH_COAGE_ONBOARDING_CANCEL\n{}\n退出当前设置；如存在本次草稿，仅清理本次草稿和临时凭据。保留已有配置，返回创作入口；没有配置时提供稍后继续设置入口。' });
+      status.textContent = '已退出这次设置，需要时可以继续。';
+    } catch { status.textContent = '可以在文字会话中说“取消设置”，稍后再继续。'; }
+  });
+  const officialFamily = form.elements.officialFamily;
+  function updateProtocol() {
+    const official = form.elements.api.value === 'official';
+    document.getElementById('oh-coage-official-family').hidden = !official;
+    officialFamily.required = official;
+  }
+  form.elements.api.addEventListener('change', updateProtocol);
+  if (data?.profileFamily) officialFamily.value = data.profileFamily;
+  updateProtocol();
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
     if (!form.reportValidity()) return;
-
-    const values = Object.fromEntries(new FormData(form).entries());
-    const sendFollowUpMessage = window.openai?.sendFollowUpMessage;
-
-    if (typeof sendFollowUpMessage !== 'function') {
-      status.textContent = '当前环境不支持提交表单，请直接在对话中输入初始化信息。';
-      status.className = 'text-small text-destructive';
+    if (typeof window.openai?.sendFollowUpMessage !== 'function') {
+      status.textContent = '当前环境无法提交表单，请通过文字会话提供：配置名称、服务地址、API Key。';
       return;
     }
-
-    status.textContent = '正在提交初始化信息...';
-    status.className = 'text-small text-muted';
-    submitButton.disabled = true;
-
+    const values = Object.fromEntries(new FormData(form));
+    if (values.manualModelIds?.trim()) values.manualModels = values.manualModelIds.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+    delete values.manualModelIds;
+    if (values.api === 'official') values.family = values.officialFamily;
+    delete values.officialFamily;
+    if (data?.editProfile) values.editProfile = data.editProfile;
+    button.disabled = true;
+    status.textContent = '正在验证连接，请稍候…';
     try {
-      await sendFollowUpMessage({
-        title: '初始化 oh-coage',
-        prompt: [
-          '用户已通过 oh-coage 初始化表单提交配置。请立即执行初始化，不要再次询问这些字段。',
-          'OH_COAGE_INIT_FORM_SUBMISSION',
-          JSON.stringify(values),
-          '使用本 skill 目录下的 scripts/setup.js，以 --activate 初始化当前 profile，把表单里的 family 通过 --family、api 通过 --api 一起传入，并把 model 通过 --model 一起传入。不要在输出、日志或回复中展示 API Key。初始化完成后运行一次本地 health-check，并报告 profile、模型族、接口协议、保存目录和检查结果。',
-        ].join('\n'),
-      });
-      status.textContent = '已提交，正在完成本地初始化。';
-      status.className = 'text-small text-muted';
-    } catch (error) {
-      status.textContent = `提交失败：${error?.message || '未知错误'}`;
-      status.className = 'text-small text-destructive';
-      submitButton.disabled = false;
+      await window.openai.sendFollowUpMessage({ title: '验证生图站点', prompt: 'OH_COAGE_CONNECTION_SUBMISSION\n' + JSON.stringify(values) + '\n按 references/onboarding.md 执行第一步：将 JSON 经 stdin 交给 scripts/onboarding.js --verify。验证失败停留第一步；成功后用 --render-models 展示第二步固定表单。不生成图片，不复述 Key。' });
+      form.elements.apiKey.value = '';
+      status.textContent = '正在验证连接，请稍候…';
+    } catch {
+      button.disabled = false;
+      status.textContent = '提交失败，请重试。';
     }
   });
 })();

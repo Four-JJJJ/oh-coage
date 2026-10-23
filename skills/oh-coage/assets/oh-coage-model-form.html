@@ -1,0 +1,153 @@
+<div id="oh-coage-model-form" class="card">
+  <h2 id="oh-coage-model-heading">选择生图模型</h2>
+  <p id="oh-coage-model-intro" class="text-small text-muted">第 2 步 / 共 2 步 · 选好一个主模型就能开始，备选可以不选。</p>
+  <p id="oh-coage-model-summary" class="text-small text-muted"></p>
+  <form>
+    <div id="oh-coage-family-groups"></div>
+    <label id="oh-coage-active-label" class="form-label" hidden>默认使用厂家<select id="oh-coage-active-family" class="form-select" aria-label="默认使用厂家"></select></label>
+    <label id="oh-coage-selection-scope" class="form-label" hidden>生效范围<select name="selectionScope" class="form-select"><option value="default" selected>保存设置</option><option value="temporary">仅本次使用主模型</option></select></label>
+    <p class="text-small text-muted">主模型明确不可用时，才尝试同厂家的一个备选；超时或结果未知时暂停。列表可见不代表已验证出图能力。</p>
+    <details id="oh-coage-more" hidden><summary>更多操作</summary><div class="viz-row"><button class="btn" type="button" id="oh-coage-refresh">刷新模型</button><button class="btn" type="button" id="oh-coage-profiles">切换配置</button></div></details>
+    <div class="viz-row"><button class="btn" type="button" id="oh-coage-back">返回</button><button class="btn" type="button" id="oh-coage-cancel">取消</button><button class="btn btn-primary" type="submit">保存并完成</button></div>
+    <p role="status" aria-live="polite"></p>
+  </form>
+</div>
+<style>
+#oh-coage-model-form { min-width: 0; overflow-wrap: anywhere; }
+#oh-coage-model-form [hidden] { display: none !important; }
+#oh-coage-model-form form, #oh-coage-family-groups { display: grid; gap: 18px; }
+#oh-coage-model-form .form-label { display: grid; gap: 8px; }
+#oh-coage-model-form select { box-sizing: border-box; width: 100%; min-width: 0; }
+#oh-coage-model-form .family-selectors { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+#oh-coage-model-form .family-heading { margin-bottom: 8px; }
+@media (max-width: 480px) { #oh-coage-model-form .family-selectors { grid-template-columns: minmax(0, 1fr); } }
+</style>
+<script>
+(() => {
+  const data = /*ONBOARDING_DATA*/null;
+  if (!data) return;
+  const root = document.getElementById('oh-coage-model-form');
+  const form = root.querySelector('form');
+  const status = form.querySelector('[role="status"]');
+  const submit = form.querySelector('[type="submit"]');
+  const families = ['openai', 'gemini', 'grok', 'other'];
+  const names = { openai: 'OpenAI', gemini: 'Gemini', grok: 'Grok', other: '其他模型' };
+  const management = data.mode === 'management';
+  const compatible = family => data.apiStyle !== 'official' || family === (data.profileFamily || 'openai');
+  const infer = id => /gemini|banana|imagen/i.test(id) ? 'gemini' : /grok/i.test(id) ? 'grok' : /gpt-image|dall-e|chatgpt-image/i.test(id) ? 'openai' : 'other';
+  const selection = Object.fromEntries(families.map(family => [family, {
+    primary: data.modelFamilies?.[family]?.primary || '',
+    fallbacks: (data.modelFamilies?.[family]?.fallbacks || []).slice(0, 1),
+  }]));
+  const ids = [...new Set([...data.models, ...Object.values(selection).flatMap(group => [group.primary, ...group.fallbacks]).filter(Boolean)])];
+  const familyOf = id => data.modelFamilyTags?.[id] || families.find(family => selection[family].primary === id || selection[family].fallbacks.includes(id)) || infer(id);
+  const missing = new Set(data.missingModels || []);
+  const active = document.getElementById('oh-coage-active-family');
+  const activeLabel = document.getElementById('oh-coage-active-label');
+  const groupRoot = document.getElementById('oh-coage-family-groups');
+  const controls = {};
+  let activeFamily = data.activeFamily || '';
+  let dirty = false;
+  const node = (tag, text, className) => {
+    const result = document.createElement(tag);
+    if (text) result.textContent = text;
+    if (className) result.className = className;
+    return result;
+  };
+  const addOption = (select, value, caption, disabled = false) => {
+    const option = node('option', caption); option.value = value; option.disabled = disabled; select.append(option);
+  };
+  document.getElementById('oh-coage-model-summary').textContent = `配置「${data.profile}」${data.unverified ? ' · 手动配置，连接尚未验证' : ''}`;
+  if (management) {
+    document.getElementById('oh-coage-model-heading').textContent = '切换模型';
+    document.getElementById('oh-coage-model-intro').textContent = '调整主模型或备选，保存后生效。仅本次使用不会修改已保存设置，也不自动使用备选。';
+    document.getElementById('oh-coage-selection-scope').hidden = false;
+    document.getElementById('oh-coage-more').hidden = false;
+    document.getElementById('oh-coage-back').hidden = true;
+    submit.textContent = '应用设置';
+  }
+  for (const family of families) {
+    const models = ids.filter(id => familyOf(id) === family);
+    if (!compatible(family) || !models.length) continue;
+    const section = node('section');
+    section.append(node('h3', names[family], 'family-heading'));
+    const fields = node('div', '', 'family-selectors');
+    const primary = node('select', '', 'form-select'); primary.setAttribute('aria-label', `${names[family]} 主模型`);
+    const backup = node('select', '', 'form-select'); backup.setAttribute('aria-label', `${names[family]} 备选模型`);
+    const primaryLabel = node('label', '主模型', 'form-label'); primaryLabel.append(primary);
+    const backupLabel = node('label', '备选模型（可选）', 'form-label'); backupLabel.append(backup);
+    fields.append(primaryLabel, backupLabel); section.append(fields); groupRoot.append(section);
+    controls[family] = { primary, backup, models };
+    primary.addEventListener('change', () => {
+      selection[family].primary = primary.value;
+      if (!primary.value || selection[family].fallbacks.includes(primary.value)) selection[family].fallbacks = [];
+      dirty = true; update();
+    });
+    backup.addEventListener('change', () => {
+      selection[family].fallbacks = backup.value ? [backup.value] : [];
+      dirty = true; update();
+    });
+  }
+  function update() {
+    const configured = families.filter(family => compatible(family) && selection[family].primary);
+    if (configured.length === 1) activeFamily = configured[0];
+    else if (!configured.includes(activeFamily)) activeFamily = '';
+    active.replaceChildren();
+    if (!activeFamily) addOption(active, '', '请选择默认厂家');
+    for (const family of configured) addOption(active, family, names[family]);
+    active.value = activeFamily; activeLabel.hidden = configured.length < 2;
+    for (const [family, { primary, backup, models }] of Object.entries(controls)) {
+      const group = selection[family];
+      primary.replaceChildren(); backup.replaceChildren();
+      addOption(primary, '', '暂不设置'); addOption(backup, '', '不使用备选');
+      for (const id of models) {
+        const caption = id + (missing.has(id) ? '（已不可用，请更换）' : '');
+        addOption(primary, id, caption, missing.has(id));
+        addOption(backup, id, caption, missing.has(id) || id === group.primary);
+      }
+      primary.value = group.primary; backup.value = group.fallbacks[0] || ''; backup.disabled = !group.primary;
+    }
+    if (!Object.keys(controls).length) status.textContent = '没有与当前协议匹配的模型，请返回修改连接，或取消后切换配置。';
+  }
+  update();
+  active.addEventListener('change', () => { activeFamily = active.value; dirty = true; });
+  async function send(marker, values, instruction) {
+    if (typeof window.openai?.sendFollowUpMessage !== 'function') throw new Error('bridge');
+    await window.openai.sendFollowUpMessage({ title: '配置生图模型', prompt: marker + '\n' + JSON.stringify(values) + '\n' + instruction });
+  }
+  document.getElementById('oh-coage-back').addEventListener('click', async () => {
+    try { await send('OH_COAGE_ONBOARDING_BACK', { draftId: data.draftId }, '按 references/onboarding.md 取消本草稿后重开连接表单，不回填 Key。'); }
+    catch { status.textContent = '请在文字会话中说“返回修改连接”。'; }
+  });
+  document.getElementById('oh-coage-cancel').addEventListener('click', async () => {
+    try { await send(management ? 'OH_COAGE_MANAGEMENT_CANCEL' : 'OH_COAGE_ONBOARDING_CANCEL', management ? { profile: data.profile } : { draftId: data.draftId }, '退出本次设置；初始化草稿通过 onboarding.js --cancel 清理，保留已有配置。'); status.textContent = '正在退出…'; }
+    catch { status.textContent = '请在文字会话中说“取消设置”。'; }
+  });
+  const mayLeave = () => !dirty || (typeof window.confirm === 'function' && window.confirm('继续会放弃尚未保存的修改，是否继续？'));
+  document.getElementById('oh-coage-refresh').addEventListener('click', async () => {
+    if (!mayLeave()) return;
+    try { await send('OH_COAGE_MODELS_REFRESH', { profile: data.profile, revision: data.revision }, '刷新当前配置的完整模型列表后重开表单，失败保留旧配置。'); }
+    catch { status.textContent = '请在文字会话中说“刷新模型”。'; }
+  });
+  document.getElementById('oh-coage-profiles').addEventListener('click', async () => {
+    if (!mayLeave()) return;
+    try { await send('OH_COAGE_PROFILES_SELECT', { profile: data.profile }, '展示已有配置选择，不自动保存当前编辑。'); }
+    catch { status.textContent = '请在文字会话中说“切换配置”。'; }
+  });
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!form.reportValidity()) return;
+    if (!activeFamily || !selection[activeFamily]?.primary || !compatible(activeFamily)) { status.textContent = '请选择主模型；配置多家时，请选择默认厂家。'; return; }
+    const action = management ? form.querySelector('[name="selectionScope"]').value : 'default';
+    const chosen = action === 'temporary' ? [activeFamily] : families.filter(family => selection[family].primary);
+    const modelFamilies = Object.fromEntries(chosen.map(family => [family, { primary: selection[family].primary, fallbacks: action === 'temporary' ? [] : selection[family].fallbacks }]));
+    if (chosen.some(family => compatible(family) && [modelFamilies[family].primary, ...modelFamilies[family].fallbacks].some(id => missing.has(id)))) { status.textContent = '所选模型已不在列表，请更换；备选可选“不使用备选”。'; return; }
+    submit.disabled = true;
+    const values = management ? { profile: data.profile, revision: data.revision, modelFamilies, activeFamily, action } : { draftId: data.draftId, modelFamilies, activeFamily };
+    try {
+      await send(management ? 'OH_COAGE_MODEL_SELECTION' : 'OH_COAGE_MODELS_SUBMISSION', values, management ? '按 references/interaction.md 将 JSON 经 stdin 交给 manage.js --apply，不生成图片。' : '将 JSON 经 stdin 交给 onboarding.js --complete，再执行 setup.js --health-check，不生成图片。');
+      status.textContent = '正在保存你的选择…';
+    } catch { submit.disabled = false; status.textContent = '提交失败，请重试，或在文字会话中提供主模型和可选的一个备选。'; }
+  });
+})();
+</script>

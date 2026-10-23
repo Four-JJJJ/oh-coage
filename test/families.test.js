@@ -352,7 +352,7 @@ test('generate uses the native protocol only when api_style is official', async 
   assert.deepEqual(seen[0].body.response_format, { type: 'image', aspect_ratio: '16:9', image_size: '2K' });
 });
 
-test('--family that no profile provides is refused clearly instead of hitting the wrong endpoint', async (t) => {
+test('--family selects that group on current profile and fails clearly when unconfigured', async (t) => {
   const home = createTempDir();
   const outputDir = createTempDir();
   const stub = createSecurityStub(t);
@@ -379,7 +379,8 @@ test('--family that no profile provides is refused clearly instead of hitting th
   ], home, stub.env);
 
   assert.equal(result.code, 1);
-  assert.match(result.stderr, /没有匹配 family=gemini/);
+  assert.match(result.stderr, /没有可用配置设置 gemini 的主模型/);
+  assert.doesNotMatch(result.stderr, /正在提交/);
 });
 
 test('setup --sync-models pulls models with the profile URL and key', async (t) => {
@@ -428,10 +429,63 @@ test('setup --sync-models pulls models with the profile URL and key', async (t) 
   assert.equal(result.code, 0, result.stderr);
   assert.equal(seenAuth, 'Bearer stub-api-key');
   assert.match(result.stdout, /grok-imagine-image-2\.0/);
-  assert.doesNotMatch(result.stdout, /grok-4/);
+  assert.match(result.stdout, /grok-4/);
 
   const saved = JSON.parse(fs.readFileSync(path.join(outputDir, 'oh-coage-config.json'), 'utf8'));
-  assert.deepEqual(saved.profiles.x.synced_models, ['grok-imagine-image-2.0', 'grok-imagine-image-1.5']);
+  assert.deepEqual(saved.profiles.x.synced_models, ['grok-imagine-image-2.0', 'grok-4', 'grok-imagine-image-1.5']);
+});
+
+test('setup sync loads every page across families and keeps the configured model order', async t => {
+  const home = createTempDir(), outputDir = createTempDir();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(outputDir, { recursive: true, force: true }));
+  const stub = createSecurityStub(t);
+  const requests = [];
+  const server = await startServer((req, res) => {
+    requests.push(req.url);
+    assert.equal(req.headers.authorization, 'Bearer stub-api-key');
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(req.url.includes('after=first')
+      ? { data: [{ id: 'gemini-exact-id' }, { id: 'text-model' }] }
+      : { data: [{ id: 'first' }], has_more: true }));
+  });
+  t.after(server.close);
+  const configPath = writeConfig(home, { active_profile: 'main', profiles: { main: {
+    family: 'openai', base_url: server.baseUrl, root_output_dir: outputDir,
+    keychain_account: 'test', model: 'first', fallback_models: ['old-backup'], synced_models: ['old-model'],
+  } } }, outputDir);
+  const result = await runNode(setupPath, ['--sync-models'], home, stub.env);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(requests, ['/v1/models', '/v1/models?after=first']);
+  const saved = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  assert.deepEqual(saved.profiles.main.synced_models, ['first', 'gemini-exact-id', 'text-model']);
+  assert.equal(saved.discovered_models['gemini-exact-id'].family, 'gemini');
+  assert.equal(saved.profiles.main.model, 'first');
+  assert.deepEqual(saved.profiles.main.fallback_models, ['old-backup']);
+});
+
+test('setup sync rejects incomplete pagination and retains the complete old configuration', async t => {
+  const home = createTempDir(), outputDir = createTempDir();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(outputDir, { recursive: true, force: true }));
+  const stub = createSecurityStub(t);
+  const requests = [];
+  const server = await startServer((req, res) => {
+    requests.push(req.url);
+    res.writeHead(req.url.includes('pageToken') ? 503 : 200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'partial-only' }], nextPageToken: 'remaining' }));
+  });
+  t.after(server.close);
+  const configPath = writeConfig(home, { active_profile: 'main', profiles: { main: {
+    family: 'openai', base_url: server.baseUrl, root_output_dir: outputDir,
+    keychain_account: 'test', model: 'keep-primary', fallback_models: ['keep-backup'], synced_models: ['keep-catalog'],
+  } } }, outputDir);
+  const before = fs.readFileSync(configPath, 'utf8');
+  const result = await runNode(setupPath, ['--sync-models'], home, stub.env);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /HTTP 503/);
+  assert.equal(requests.length, 2);
+  assert.equal(fs.readFileSync(configPath, 'utf8'), before);
 });
 
 test('setup --model resolves family short names against the active profile family', async (t) => {

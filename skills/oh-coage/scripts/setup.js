@@ -6,6 +6,8 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const { getFamilyConfig, normalizeFamilySelection, inferModelFamily } = require('./family-config');
 const https = require('https');
 const http = require('http');
 const {
@@ -15,6 +17,7 @@ const {
   normalizeBaseUrl,
   assertValidBaseUrl,
   loadActiveConfig,
+  loadConfigFromPath,
   saveState,
   getDefaultConfigPath,
   saveConfig,
@@ -33,8 +36,7 @@ const {
   isClearModelInput,
   isBuiltinModelKey,
   normalizeModelInput,
-} = require('./models');
-const { resolveDefaultOutputDir } = require('./resolve-output-dir');
+} = require('./models');const { resolveDefaultOutputDir } = require('./resolve-output-dir');
 const {
   FAMILIES,
   normalizeFamily,
@@ -95,6 +97,26 @@ function parseArgs() {
         parsed.profileModel = value;
         break;
       }
+      case '--primary-model': {
+        const value = args[++i];
+        if (!value || value.startsWith('--')) {
+          console.error('--primary-model 需要一个模型短名，或用 "none" 取消固定');
+          process.exit(1);
+        }
+        parsed.profileModel = value;
+        break;
+      }
+      case '--fallback-model': {
+        const value = args[++i];
+        if (!value || value.startsWith('--')) {
+          console.error('--fallback-model 需要一个模型短名，可重复传入多个');
+          process.exit(1);
+        }
+        parsed.fallbackModels ||= [];
+        parsed.fallbackModels.push(value);
+        break;
+      }
+      case '--clear-fallback-models': parsed.clearFallbackModels = true; break;
       case '--image-field': parsed.imageField = args[++i]; break;
       case '--image-transport': parsed.imageTransport = args[++i]; break;
       case '--image-shape': parsed.imageShape = args[++i]; break;
@@ -109,7 +131,7 @@ function parseArgs() {
 function printUsage() {
   console.error('用法:');
   console.error('  初始化或新增 profile（--output-dir 可省，默认落到项目根或桌面）:');
-  console.error('    node setup.js --profile "main" --base-url "https://example.com/v1" --api-key "KEY" [--output-dir "/path/to/images"] [--activate] [--family openai|gemini|grok] [--api openai|official] [--model "image-2"]');
+  console.error('    node setup.js --profile "main" --base-url "https://example.com/v1" --api-key "KEY" [--output-dir "/path/to/images"] [--activate] [--family openai|gemini|grok] [--api openai|official] [--model "image-2"] [--fallback-model "image-2.5-flare"]');
   console.error('  拉取该 profile 支持的模型（用它的 URL + Key）:');
   console.error('    node setup.js --sync-models [--profile "main"]');
   console.error('  列出 profile:');
@@ -136,6 +158,12 @@ function printUsage() {
   console.error('    node setup.js --profile-model "image-2.5-flare" [--profile "main"]');
   console.error('  取消固定，让它跟随全局当前模型:');
   console.error('    node setup.js --profile-model none [--profile "main"]');
+  console.error('  给同一 profile 配置主备模型链（首选 + 备用，失败自动换备用）:');
+  console.error('    node setup.js --primary-model "image-2" --fallback-model "image-2.5-flare" --fallback-model "banana-2.1" [--profile "main"]');
+  console.error('  只改备用模型（不动首选）:');
+  console.error('    node setup.js --fallback-model "image-2.5-flare" [--profile "main"]');
+  console.error('  清除备用模型（保留首选）:');
+  console.error('    node setup.js --clear-fallback-models [--profile "main"]');
   console.error('  配置图生图适配（不写 --profile 则作用于当前 profile）:');
   console.error('    node setup.js --image-transport json|multipart [--image-field image_urls] [--image-shape array|array-object|single] [--image-endpoint /images/edits] [--profile "main"]');
   console.error('  清除图生图适配，回到内置默认:');
@@ -203,11 +231,14 @@ function listProfiles() {
   Object.entries(config.profiles || {}).forEach(([name, profile]) => {
     const flag = name === config.active_profile ? '*' : ' ';
     const modelNote = profile.model ? ` [model: ${profile.model}]` : '';
+    const fallbackNote = Array.isArray(profile.fallback_models) && profile.fallback_models.length
+      ? ` [备用: ${profile.fallback_models.join(' -> ')}]`
+      : '';
     const syncedNote = Array.isArray(profile.synced_models) && profile.synced_models.length
       ? ` [synced: ${profile.synced_models.length}]`
       : '';
     const imageNote = hasImageOptions(profile) ? ` [图生图: ${describeImageOptions(profile)}]` : '';
-    console.log(`${flag} ${name} (${describeProfile(profile)}) -> ${profile.base_url} -> ${profile.root_output_dir || profile.output_dir}${modelNote}${syncedNote}${imageNote}`);
+    console.log(`${flag} ${name} (${describeProfile(profile)}) -> ${profile.base_url} -> ${profile.root_output_dir || profile.output_dir}${modelNote}${fallbackNote}${syncedNote}${imageNote}`);
   });
 }
 
@@ -245,58 +276,63 @@ function fetchJson(url, headers, timeoutMs = 20000) {
   });
 }
 
-/** 用该 profile 自己的 URL 和 Key 拉取模型列表，并只缓存该模型族的生图模型。 */
+/** Refresh the actual site catalog without changing the saved model order. */
 async function syncProfileModels(profileName) {
   const { config, configPath } = requireConfig();
   const targetName = profileName || config.active_profile;
   const profile = config.profiles?.[targetName];
-
-  if (!profile) {
-    throw new Error(`profile 不存在: ${targetName}`);
-  }
-
+  if (!profile) throw new Error(`profile 不存在: ${targetName}`);
   const family = profileFamily(profile);
   const apiStyle = profileApiStyle(profile, family);
   const baseUrl = normalizeBaseUrl(profile.base_url);
   assertValidBaseUrl(baseUrl);
-
   const apiKey = readKeychainSecret(profile.keychain_account);
   const spec = buildModelListRequest({ family, apiStyle, baseUrl, apiKey });
-  const payload = await fetchJson(spec.url, spec.headers);
-  const discovered = modelEntriesFromList(family, payload);
-
-  if (discovered.length === 0) {
-    const total = (payload?.data || payload?.models || []).length;
-    throw new Error(
-      `模型列表里没有识别到 ${family} 的生图模型（共返回 ${total} 个）。`
-      + '如果该站点用了自定义命名，请用 setup.js --add-model 手动指定 model ID。',
-    );
+  const ids = new Set();
+  const pages = new Set();
+  let next = spec.url;
+  for (let page = 0; next; page++) {
+    if (page >= 100 || pages.has(next)) throw new Error('模型列表分页异常；旧列表和模型顺序未修改。');
+    pages.add(next);
+    let response;
+    try { response = await fetch(next, { headers: spec.headers, redirect: 'error', signal: AbortSignal.timeout(20000) }); }
+    catch { throw new Error('模型列表连接失败；请重试刷新，旧列表和模型顺序未修改。'); }
+    if (!response.ok) throw new Error(`模型列表 HTTP ${response.status}；旧列表和模型顺序未修改。`);
+    const payload = await response.json();
+    const rows = payload.data || payload.models;
+    if (!Array.isArray(rows)) throw new Error('模型列表格式无效；旧列表未修改。');
+    for (const row of rows) {
+      const id = typeof row === 'string' ? row : row?.id || row?.name || row?.model;
+      if (typeof id === 'string' && id.trim()) ids.add(id.replace(/^models\//, ''));
+    }
+    next = null;
+    if (payload.nextPageToken) {
+      const url = new URL(spec.url);
+      url.searchParams.set('pageToken', payload.nextPageToken);
+      next = url.href;
+    } else if (payload.has_more === true) {
+      const cursor = rows.at(-1)?.id;
+      if (!cursor) throw new Error('模型列表分页缺少游标；旧列表未修改。');
+      const url = new URL(spec.url);
+      url.searchParams.set('after', cursor);
+      next = url.href;
+    }
   }
-
+  if (!ids.size) throw new Error('站点返回空模型列表；旧列表未修改。可重新验证连接或手动填写准确模型 ID。');
   const syncedAt = new Date().toISOString();
-  profile.synced_models = discovered.map((entry) => entry.model);
+  profile.synced_models = [...ids];
   profile.models_synced_at = syncedAt;
   profile.updated_at = syncedAt;
   config.updated_at = syncedAt;
-
-  // 拉取结果按 family 标记进全局目录，避免不同站点互相覆盖
   config.discovered_models ||= {};
-  for (const entry of discovered) {
-    config.discovered_models[entry.model] = {
-      model: entry.model,
-      family,
-      source_profile: targetName,
-      updated_at: syncedAt,
-    };
+  for (const model of ids) {
+    const inferred = /gemini|banana|imagen/i.test(model) ? 'gemini' : /grok/i.test(model) ? 'grok' : family;
+    config.discovered_models[model] = { model, family: inferred, source_profile: targetName, updated_at: syncedAt };
   }
-
   saveConfig(configPath, config);
-
-  console.log(`已从 ${baseUrl} 拉取 ${family} 模型：${discovered.length} 个`);
-  discovered.forEach((entry) => console.log(`  ${entry.model}`));
-  console.log(`已写入 profile ${targetName} 的 synced_models，并合并进模型目录。`);
-
-  return discovered;
+  console.log(`已从 ${baseUrl} 全量拉取模型：${ids.size} 个；已保存的使用顺序保持不变。`);
+  ids.forEach(model => console.log(`  ${model}`));
+  return [...ids].map(model => ({ model }));
 }
 
 function probeUrl(url, timeoutMs = 8000) {
@@ -376,7 +412,7 @@ async function healthCheck(options) {
 
     try {
       const profileModel = profile.model
-        ? resolveModel(profile.model, config, profileFamily(profile))
+        ? resolveModel(profile.model, config, null, true)
         : resolveConfiguredModel(config, profileFamily(profile));
       checks.push({
         item: 'model',
@@ -385,6 +421,26 @@ async function healthCheck(options) {
       });
     } catch (error) {
       checks.push({ item: 'model', ok: false, detail: error.message.split('\n')[0] });
+    }
+
+    // 备用模型写错了不应该等到出图时才发現：在健康检查里先报出来
+    if (Array.isArray(profile.fallback_models) && profile.fallback_models.length) {
+      const resolvedFallbacks = [];
+      const brokenFallbacks = [];
+      for (const key of profile.fallback_models) {
+        try {
+          resolvedFallbacks.push(resolveModel(key, config, null, true).model);
+        } catch (error) {
+          brokenFallbacks.push(`${key}（${error.message.split('\n')[0]}）`);
+        }
+      }
+      checks.push({
+        item: 'fallback_models',
+        ok: brokenFallbacks.length === 0,
+        detail: brokenFallbacks.length
+          ? `无效: ${brokenFallbacks.join('; ')}`
+          : resolvedFallbacks.join(' -> '),
+      });
     }
 
     checks.push({ item: 'interface', ok: true, detail: describeProfile(profile) });
@@ -462,7 +518,7 @@ function switchModel(modelInput, family) {
   saveConfig(configPath, config);
 
   console.log(`已切换当前模型: ${resolved.key} -> ${resolved.model}（${resolved.family}）`);
-  console.log('后续生成都会使用这个模型，直到你再次切换。');
+  console.log('这是旧版全局设置；配置内已固定的模型优先。日常切换请使用 manage.js --apply 修改当前配置。');
 }
 
 function addCustomModel(options) {
@@ -539,6 +595,23 @@ function deleteCustomModel(modelInput) {
   console.log(`已删除自定义模型: ${key}`);
 }
 
+function syncGroupedProfile(profile, config) {
+  if (!profile.model_families) return;
+  if (!profile.model) throw new Error('按厂家配置不支持取消固定模型；请使用 manage.js --render 为厂家选择主要模型或移除该组。');
+  const exact = key => resolveModel(key, config, null, true).model;
+  const primary = exact(profile.model);
+  const family = inferModelFamily(primary, profile, config);
+  const fallbacks = (profile.fallback_models || []).map(exact).filter(id => id !== primary);
+  if (fallbacks.some(id => inferModelFamily(id, profile, config) !== family)) throw new Error('主备模型必须属于同一厂家；请使用 manage.js --render 分别配置各厂家的主要和备选模型。');
+  const { modelFamilies } = getFamilyConfig(profile, config);
+  modelFamilies[family] = { primary, fallbacks: [...new Set(fallbacks)] };
+  const normalized = normalizeFamilySelection(modelFamilies, family, { profile, config });
+  profile.model_families = normalized.modelFamilies;
+  profile.active_model_family = normalized.activeFamily;
+  profile.model = primary;
+  profile.fallback_models = modelFamilies[family].fallbacks;
+}
+
 function setProfileModel(options) {
   const { config, configPath } = requireConfig();
   const targetName = options.profile || config.active_profile;
@@ -548,21 +621,66 @@ function setProfileModel(options) {
     throw new Error(`profile 不存在: ${targetName}`);
   }
 
+  const wantsFallbackChange = Boolean(options.fallbackModels?.length) || options.clearFallbackModels === true;
+  const family = profileFamily(profile);
+
+  // 先把所有输入都验一遍再落盘，避免写进一半合法一半非法的配置
+  const nextFallbackKeys = [];
+  if (options.fallbackModels?.length) {
+    for (const input of options.fallbackModels) {
+      const resolved = resolveModel(input, config, null, true);
+      if (!nextFallbackKeys.includes(resolved.key)) nextFallbackKeys.push(resolved.key);
+    }
+  }
+
+  let nextPrimaryKey;
+  if (options.profileModel !== undefined && !isClearModelInput(options.profileModel)) {
+    nextPrimaryKey = resolveModel(options.profileModel, config, null, true).key;
+  }
+
   profile.updated_at = new Date().toISOString();
   config.updated_at = profile.updated_at;
 
-  if (isClearModelInput(options.profileModel)) {
+  if (nextPrimaryKey !== undefined) {
+    profile.model = nextPrimaryKey;
+  } else if (options.profileModel !== undefined) {
     delete profile.model;
-    saveConfig(configPath, config);
-    console.log(`已取消 profile ${targetName} 的固定模型，将跟随全局当前模型。`);
-    return;
   }
 
-  const resolved = resolveModel(options.profileModel, config, profileFamily(profile));
-  profile.model = resolved.key;
+  if (wantsFallbackChange) {
+    const merged = options.clearFallbackModels ? [] : [...nextFallbackKeys];
+    // 备用模型不能和首选重复，否则同一模型会被尝试两次，白花配额
+    const primaryKey = profile.model || resolveConfiguredModel(config, family).key;
+    const deduped = merged.filter((key) => key !== primaryKey);
+    if (deduped.length > 0) {
+      profile.fallback_models = deduped;
+    } else {
+      delete profile.fallback_models;
+    }
+  }
+
+  syncGroupedProfile(profile, config);
   saveConfig(configPath, config);
 
-  console.log(`已固定 profile ${targetName} 使用模型: ${resolved.key} -> ${resolved.model}`);
+  if (nextPrimaryKey !== undefined) {
+    console.log(`已固定 profile ${targetName} 使用模型: ${nextPrimaryKey} -> ${resolveModel(nextPrimaryKey, config, null, true).model}`);
+  } else if (options.profileModel !== undefined) {
+    console.log(`已取消 profile ${targetName} 的固定模型，将跟随全局当前模型。`);
+  }
+
+  if (wantsFallbackChange) {
+    const fallbacks = profile.fallback_models || [];
+    console.log(fallbacks.length
+      ? `已设置 profile ${targetName} 的备用模型: ${fallbacks.join(' -> ')}`
+      : `已清除 profile ${targetName} 的备用模型。`);
+    if (fallbacks.length) {
+      console.log('生成时首选模型失败（鉴权/限流/5xx/模型不可用）会自动按顺序换备用模型，站点、Key 和输出目录不变。');
+    }
+  }
+
+  if (nextPrimaryKey === undefined && options.profileModel === undefined && !wantsFallbackChange) {
+    console.log(`profile ${targetName} 当前模型: ${profile.model || '（跟随全局）'}，备用: ${(profile.fallback_models || []).join(' -> ') || '（无）'}`);
+  }
 }
 
 /**
@@ -639,9 +757,9 @@ function validateProfileName(name) {
   if (!name) {
     throw new Error('profile 名称不能为空。');
   }
-  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(name)) {
+  if (name.length > 64 || /[\x00-\x1f\x7f/\\]/.test(name) || ['__proto__', 'constructor', 'prototype'].includes(name)) {
     throw new Error(
-      `profile 名称不合法：${name}。只能包含字母、数字、下划线、点和短横线，长度 1-64。`,
+      'profile 名称不合法：支持中文，长度 1-64，不能包含路径分隔符、控制字符或保留名称。',
     );
   }
   return name;
@@ -684,8 +802,9 @@ function upsertProfile(options) {
     config.current_model = DEFAULT_MODEL_KEY;
   }
 
-  const keychainAccount = config.profiles[options.profile]?.keychain_account || buildKeychainAccount(options.profile, configPath);
-  saveKeychainSecret(keychainAccount, options.apiKey);
+  const expectedRevision = existingConfig ? existingConfig._loadedRevision : null;
+  const oldAccount = config.profiles[options.profile]?.keychain_account;
+  const keychainAccount = `${buildKeychainAccount(options.profile, configPath)}:update:${crypto.randomBytes(16).toString('hex')}`;
 
   const previous = config.profiles[options.profile] || {};
   config.profiles[options.profile] = {
@@ -710,7 +829,21 @@ function upsertProfile(options) {
 
   // 初始化时可以直接给这个 profile 固定模型
   if (options.profileModel && !isClearModelInput(options.profileModel)) {
-    config.profiles[options.profile].model = resolveModel(options.profileModel, config, family).key;
+    config.profiles[options.profile].model = resolveModel(options.profileModel, config, null, true).key;
+  }
+
+  // 初始化时也可以一次把备用模型配好，省得再跑一次 setup
+  if (options.fallbackModels?.length) {
+    const primaryKey = config.profiles[options.profile].model || resolveConfiguredModel(config, family).key;
+    const fallbackKeys = [];
+    for (const input of options.fallbackModels) {
+      const key = resolveModel(input, config, null, true).key;
+      // 备用不能与首选/其他备用重复，否则同一模型会被试两次
+      if (key !== primaryKey && !fallbackKeys.includes(key)) fallbackKeys.push(key);
+    }
+    if (fallbackKeys.length > 0) {
+      config.profiles[options.profile].fallback_models = fallbackKeys;
+    }
   }
 
   if (options.activate || !config.active_profile) {
@@ -718,7 +851,30 @@ function upsertProfile(options) {
   }
   config.updated_at = new Date().toISOString();
 
-  saveConfig(configPath, config);
+  syncGroupedProfile(config.profiles[options.profile], config);
+  // Validate the complete update before writing any credential.
+  const target = config.profiles[options.profile];
+  resolveImageOptions({ imageField: target.image_field, imageTransport: target.image_transport, imageShape: target.image_shape, imageEndpoint: target.image_endpoint }, { family, apiStyle });
+  if (options.model) resolveModel(options.model, config, options.family);
+  let committed = false;
+  try {
+    saveKeychainSecret(keychainAccount, options.apiKey);
+    saveConfig(configPath, config, { sha256: expectedRevision });
+    committed = true;
+  } catch (error) {
+    // A failed CAS must never overwrite or remove an existing profile's key.
+    try {
+      const persisted = loadConfigFromPath(configPath);
+      if (!Object.values(persisted?.profiles || {}).some(profile => profile.keychain_account === keychainAccount)) deleteKeychainSecret(keychainAccount);
+    } catch {}
+    throw error;
+  }
+  if (committed && oldAccount && oldAccount !== keychainAccount) {
+    try {
+      const persisted = loadConfigFromPath(configPath);
+      if (!Object.values(persisted?.profiles || {}).some(profile => profile.keychain_account === oldAccount)) deleteKeychainSecret(oldAccount);
+    } catch { console.error('提示：配置已保存，旧凭据暂未清理。'); }
+  }
   saveState({ config_path: configPath });
 
   console.log(`配置已保存: ${configPath}`);
@@ -728,6 +884,10 @@ function upsertProfile(options) {
   console.log(`root_output_dir: ${config.profiles[options.profile].root_output_dir}${options.outputDir ? '' : '（未指定，已自动推导）'}`);
   console.log(`active_profile: ${config.active_profile}`);
   console.log(`profile_model: ${config.profiles[options.profile].model || '（跟随全局）'}`);
+  const savedFallbacks = config.profiles[options.profile].fallback_models || [];
+  if (savedFallbacks.length) {
+    console.log(`fallback_models: ${savedFallbacks.join(' -> ')}（首选失败时自动换）`);
+  }
   if (hasImageOptions(config.profiles[options.profile])) {
     console.log(`图生图适配: ${describeImageOptions(config.profiles[options.profile])}`);
   }
@@ -742,25 +902,21 @@ function deleteProfile(profileName) {
   }
 
   const profileNames = Object.keys(config.profiles);
-  if (profileNames.length === 1) {
-    throw new Error('当前只剩最后一个 profile，不能直接删除。若要彻底移除，请使用 --uninstall-skill。');
-  }
-
-  if (profile.keychain_account) {
-    deleteKeychainSecret(profile.keychain_account);
-  }
-
   delete config.profiles[profileName];
 
   if (config.active_profile === profileName) {
-    config.active_profile = Object.keys(config.profiles)[0];
+    config.active_profile = Object.keys(config.profiles).find(name => config.profiles[name].enabled !== false) || null;
   }
 
   config.updated_at = new Date().toISOString();
   saveConfig(configPath, config);
+  if (profile.keychain_account && !Object.values(config.profiles).some(item => item.keychain_account === profile.keychain_account)) {
+    try { deleteKeychainSecret(profile.keychain_account); }
+    catch { console.error('配置已删除，但旧 Keychain 记录清理失败；可稍后重试清理，不影响其余配置。'); }
+  }
 
   console.log(`已删除 profile: ${profileName}`);
-  console.log(`当前 active_profile: ${config.active_profile}`);
+  console.log(config.active_profile ? `当前 active_profile: ${config.active_profile}` : '当前没有配置；下次使用将进入初始化。已生成图片和日志保留。');
 }
 
 function renameProfile(oldName, newName) {
@@ -780,23 +936,10 @@ function renameProfile(oldName, newName) {
     throw new Error(`目标 profile 已存在: ${newName}`);
   }
 
-  const newKeychainAccount = buildKeychainAccount(newName, configPath);
   config.profiles[newName] = {
     ...profile,
-    keychain_account: newKeychainAccount,
     updated_at: new Date().toISOString(),
   };
-
-  if (profile.keychain_account) {
-    try {
-      const key = readKeychainSecret(profile.keychain_account);
-      saveKeychainSecret(newKeychainAccount, key);
-      deleteKeychainSecret(profile.keychain_account);
-    } catch (error) {
-      delete config.profiles[newName];
-      throw error;
-    }
-  }
 
   delete config.profiles[oldName];
 
@@ -850,6 +993,7 @@ function uninstallSkill(options) {
 
 function main() {
   const options = parseArgs();
+  if (new Set(options.fallbackModels || []).size > 1) throw new Error('最多选择一个备选模型，请只传一个 --fallback-model。');
 
   if (options.list) {
     listProfiles();
@@ -875,6 +1019,12 @@ function main() {
   }
 
   if (options.profileModel !== undefined && !isInitRequest(options)) {
+    setProfileModel(options);
+    return;
+  }
+
+  // 只给备用模型（不动首选）也是纯本地配置，不该触发初始化
+  if ((options.fallbackModels?.length || options.clearFallbackModels) && !isInitRequest(options)) {
     setProfileModel(options);
     return;
   }

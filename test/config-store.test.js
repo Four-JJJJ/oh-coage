@@ -90,3 +90,34 @@ test('writeJson leaves no temp file behind', (t) => {
     [],
   );
 });
+
+test('stale configuration snapshots cannot overwrite a newer write', t => {
+  const dir = createTempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const configPath = path.join(dir, 'config.json');
+  writeRelativeConfig(configPath);
+  const first = loadConfigFromPath(configPath);
+  const stale = loadConfigFromPath(configPath);
+  first.active_profile = 'newer';
+  saveConfig(configPath, first);
+  stale.active_profile = 'stale';
+  assert.throws(() => saveConfig(configPath, stale), /配置已被其他操作更新/);
+  assert.equal(loadConfigFromPath(configPath).active_profile, 'newer');
+  assert.equal(fs.existsSync(`${configPath}.lock`), false);
+});
+
+test('explicit absent-file revision refuses replacing an existing file', t => {
+  const dir = createTempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const configPath = path.join(dir, 'config.json');
+  writeRelativeConfig(configPath);
+  assert.throws(() => saveConfig(configPath, { profiles: {} }, { sha256: null }), /重新加载/);
+  assert.ok(loadConfigFromPath(configPath).profiles.shared);
+});
+
+test('URL credentials and query parameters are rejected', () => {
+  const { assertValidBaseUrl } = require('../skills/oh-coage/scripts/config-store');
+  for (const url of ['https://user:secret@example.test/v1', 'https://example.test/v1?key=secret', 'https://example.test/v1#fragment']) {
+    assert.throws(() => assertValidBaseUrl(url), /不得包含/);
+  }
+});

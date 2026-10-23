@@ -9,6 +9,7 @@ const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const { safeDetail, formatGenerationError } = require('./generation-errors');
 const {
   DEFAULT_BASE_URL,
   RUNS_PATH,
@@ -19,7 +20,8 @@ const {
   ensureDir,
   appendJsonl,
 } = require('./config-store');
-const { resolveModel, resolveModelForProfile } = require('./models');
+const { resolveModel, resolveProfileModel, resolveModelChainForProfile } = require('./models');
+const { FAMILIES, getFamilyConfig } = require('./family-config');
 const {
   normalizeFamily,
   normalizeApiStyle,
@@ -42,6 +44,8 @@ const MAX_REDIRECTS = 5;
 const MAX_ERROR_SNIPPET = 300;
 const MAX_LOG_ERROR_LENGTH = 500;
 const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
+// 这些状态码需继续检查服务错误码，只有明确的模型拒绝才允许尝试备选。
+const MODEL_LEVEL_STATUS_CODES = new Set([400, 404, 422]);
 const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308]);
 // 站点各写各的，把常见的终态写法定下来，避免因为不认某个词而空转到 5 分钟超时
 const COMPLETED_TASK_STATUSES = new Set(['completed', 'complete', 'succeeded', 'success', 'done', 'finished']);
@@ -56,19 +60,8 @@ const IMAGE_MIME_TYPES = new Map([
 ]);
 
 function printSetupInstructions() {
-  console.error('错误：尚未完成 oh-coage 初始化。');
-  console.error('请先让 agent 收集以下信息后运行 setup.js：');
-  console.error('1. 图片总保存目录');
-  console.error('2. profile 名称');
-  console.error('3. base_url');
-  console.error('4. api_key');
-  console.error('');
-  console.error('示例：');
-  console.error('node "$SKILL_DIR/scripts/setup.js" \\');
-  console.error('  --output-dir "/absolute/path/to/save" \\');
-  console.error('  --profile "default" \\');
-  console.error('  --base-url "https://your-image-site.example/v1" \\');
-  console.error('  --api-key "YOUR_KEY"');
+  console.error('还没有连接生图服务。完成配置后，就可以开始创作。');
+  console.error('请打开初始化表单，填写配置名称、服务地址和 API Key，再选择模型。入口：onboarding.js --render-connection；无法展示表单时使用固定文字流程。');
 }
 
 function sleep(ms) {
@@ -76,7 +69,7 @@ function sleep(ms) {
 }
 
 function truncateForLog(value, maxLength = MAX_ERROR_SNIPPET) {
-  const text = String(value ?? '');
+  const text = safeDetail(value);
   return text.length > maxLength ? `${text.slice(0, maxLength)}…（已截断，原始 ${text.length} 字符）` : text;
 }
 
@@ -88,6 +81,7 @@ function markFallback(error, kind) {
 }
 
 function parseHttpStatus(error) {
+  if (Number.isInteger(error?.statusCode)) return error.statusCode;
   const match = String(error?.message || '').match(/HTTP\s+(\d{3})/);
   return match ? Number(match[1]) : null;
 }
@@ -98,44 +92,48 @@ const NEVER_SENT_NETWORK_ERRORS = ['econnrefused', 'enotfound', 'eai_again'];
 const AMBIGUOUS_NETWORK_ERRORS = ['timed out', 'timeout', 'socket hang up', 'econnreset', 'epipe'];
 
 /**
- * 把错误归类，决定「要不要重试」和「要不要换 profile」。
+ * 把错误归类，决定「要不要重试」和「要不要换 profile / 换模型」。
  *
  * @param {Error} error
  * @param {{ idempotent?: boolean }} options
  *   idempotent=true（默认）：幂等请求（轮询用的 GET）。超时/重置可以放心重试。
  *   idempotent=false：非幂等请求（提交生成的 POST）。超时/重置**不能**重试——
- *     服务端可能已经收下并计费了，重发就是重复扣费。这类错误只换 profile。
+ *     服务端可能已经收下并计费了，重发就是重复扣费。这类错误暂停提交并保留恢复记录。
+ *
+ * 返回值里的 resubmittable 表示「能不能再发一次生成请求」（换备用模型或换 profile 都算）：
+ * 只有明确未送达或服务明确拒绝时才允许重发；这不代表已核实账单。
  */
 function classifyError(error, options = {}) {
+  if (error?.generationClassification) return error.generationClassification;
   const idempotent = options.idempotent !== false;
   const message = String(error?.message || '');
   const statusCode = parseHttpStatus(error);
   const lower = message.toLowerCase();
-
+  const result = (kind, retryable, fallback, resubmittable) => ({ kind, statusCode, retryable, fallback, resubmittable });
+  if (error?.generationAccepted) return result(error.kind || 'recovery', false, false, false);
+  const serviceError = `${error?.serviceCode || ''} ${message}`;
+  if (statusCode === 402 || /insufficient[_ -]?(quota|balance|credit|funds)|quota[_ -]?(exceeded|exhausted)|billing[_ -](hard[_ -]limit|not[_ -]active)|余额不足|额度不足|配额.{0,4}(不足|用尽|耗尽)/i.test(serviceError)) return result('quota', false, false, false);
+  if (error?.stage === 'preflight') return result(error.kind || 'parameters', false, false, false);
   if (error?.fallback === true) {
-    return { kind: error.kind || 'unknown', statusCode, retryable: false, fallback: true };
+    const kind = error.kind || 'unknown';
+    return result(kind, false, kind !== 'download', kind !== 'download');
   }
-
-  if (statusCode === 401 || statusCode === 403) {
-    return { kind: 'auth', statusCode, retryable: false, fallback: true };
+  if (statusCode === 401) return result('auth', false, true, true);
+  if (/content_policy|safety|moderation|内容.{0,4}(拒绝|违规)/i.test(serviceError)) return result('content', false, false, false);
+  if (statusCode === 403) {
+    const modelPermission = /model.{0,60}(permission|access|not allowed)|(?:permission|access).{0,60}model/i.test(serviceError);
+    return result(modelPermission ? 'model' : 'permission', false, modelPermission, modelPermission);
   }
-  if (statusCode && RETRYABLE_STATUS_CODES.has(statusCode)) {
-    // 服务端明确回了错误状态码，说明它知道自己失败了，重试是安全的
-    return { kind: statusCode === 429 ? 'rate_limit' : 'upstream', statusCode, retryable: true, fallback: true };
+  if (statusCode === 429) return result('rate_limit', true, true, true);
+  if (statusCode && RETRYABLE_STATUS_CODES.has(statusCode)) return result('upstream', idempotent, idempotent, idempotent);
+  if (statusCode && MODEL_LEVEL_STATUS_CODES.has(statusCode)) {
+    const modelUnavailable = /model[_ -]?(not[_ -]?found|unavailable|unsupported)|(?:unknown|unsupported|invalid|no such) model|model.{0,100}(not found|not exist|does not exist|not supported|unavailable)/i.test(serviceError);
+    return result(modelUnavailable ? 'model' : 'parameters', false, modelUnavailable, modelUnavailable);
   }
-
-  const neverSent = NEVER_SENT_NETWORK_ERRORS.some((token) => lower.includes(token));
-  if (neverSent) {
-    return { kind: 'network', statusCode, retryable: true, fallback: true };
-  }
-
-  const ambiguous = AMBIGUOUS_NETWORK_ERRORS.some((token) => lower.includes(token));
-  if (ambiguous) {
-    // 非幂等请求遇到含义模糊的网络错误：不重发，只换 profile
-    return { kind: 'network', statusCode, retryable: idempotent, fallback: true };
-  }
-
-  return { kind: 'unknown', statusCode, retryable: false, fallback: false };
+  if (NEVER_SENT_NETWORK_ERRORS.some((token) => lower.includes(token))) return result('network', true, true, true);
+  if (/certificate|cert_|tls|ssl|self.signed|unable_to_verify|hostname.*match/i.test(`${error?.code || ''} ${message}`)) return result('tls', false, false, false);
+  if (AMBIGUOUS_NETWORK_ERRORS.some((token) => lower.includes(token))) return result('network', idempotent, idempotent, false);
+  return result('unknown', false, false, false);
 }
 
 function request(url, options, body, timeoutMs = REQUEST_TIMEOUT_MS) {
@@ -149,7 +147,16 @@ function request(url, options, body, timeoutMs = REQUEST_TIMEOUT_MS) {
       res.on('end', () => {
         const raw = Buffer.concat(chunks).toString('utf-8');
         if (res.statusCode >= 400) {
-          reject(new Error(`HTTP ${res.statusCode}: ${truncateForLog(raw)}`));
+          const error = new Error(`HTTP ${res.statusCode}: ${truncateForLog(raw)}`);
+          error.statusCode = res.statusCode;
+          try {
+            const parsed = JSON.parse(raw);
+            error.serviceCode = String(parsed?.error?.code || parsed?.error?.type || parsed?.code || '');
+          } catch { /* Non-JSON error responses retain their HTTP status and text. */ }
+          const retryAfter = res.headers['retry-after'];
+          const seconds = Number(retryAfter);
+          error.retryAfterMs = retryAfter ? (Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - Date.now()) : null;
+          reject(error);
           return;
         }
 
@@ -190,48 +197,57 @@ function extractImagePayload(result) {
 }
 
 async function submitGeneration({ apiKey, baseUrl, family, apiStyle, imageOptions, params }) {
-  const requestSpec = buildRequest({ family, apiStyle, ...params, apiKey, imageOptions });
-  const endpointBase = resolveEndpointBaseUrl({ family, apiStyle, baseUrl });
-  let url;
-  if (/^https?:\/\//i.test(requestSpec.path)) {
-    // 允许跨域端点（少数网关把生图和改图放在不同域名），但要把 key 的去向说清楚。
-    // 否则一个写错的 --image-endpoint 就会把 Authorization 静默发到任意主机。
-    const target = new URL(requestSpec.path);
-    const origin = new URL(endpointBase);
-    if (target.origin !== origin.origin) {
-      process.stderr.write(
-        `警告：本次请求发往 ${target.origin}，与 profile 的 base_url (${origin.origin}) 不同，`
-        + 'API Key 会一并发送到该地址。请确认它可信。\n',
-      );
+  let stage = 'preflight';
+  try {
+    const requestSpec = buildRequest({ family, apiStyle, ...params, apiKey, imageOptions });
+    const endpointBase = resolveEndpointBaseUrl({ family, apiStyle, baseUrl });
+    let url;
+    if (/^https?:\/\//i.test(requestSpec.path)) {
+      // 允许跨域端点（少数网关把生图和改图放在不同域名），但要把 key 的去向说清楚。
+      // 否则一个写错的 --image-endpoint 就会把 Authorization 静默发到任意主机。
+      const target = new URL(requestSpec.path);
+      const origin = new URL(endpointBase);
+      if (target.origin !== origin.origin) {
+        process.stderr.write(
+          `警告：本次请求发往 ${target.origin}，与 profile 的 base_url (${origin.origin}) 不同，`
+          + 'API Key 会一并发送到该地址。请确认它可信。\n',
+        );
+      }
+      url = requestSpec.path;
+    } else {
+      url = `${endpointBase}${requestSpec.path}`;
     }
-    url = requestSpec.path;
-  } else {
-    url = `${endpointBase}${requestSpec.path}`;
+
+    let contentType = 'application/json';
+    let payload = JSON.stringify(requestSpec.body);
+
+    if (requestSpec.transport === 'multipart') {
+      const multipart = buildMultipartBody(requestSpec);
+      contentType = multipart.contentType;
+      payload = multipart.payload;
+    }
+
+    stage = 'submit';
+    const result = await request(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': contentType,
+        ...requestSpec.headers,
+      },
+    }, payload, REQUEST_TIMEOUT_MS);
+
+    const extracted = extractImages({ family, apiStyle }, result);
+    if (extracted.mode === 'async' || extracted.images.length > 0) {
+      return extracted;
+    }
+
+    const error = new Error(`无法识别生成接口返回结构: ${truncateForLog(JSON.stringify(result), MAX_ERROR_SNIPPET)}`);
+    error.kind = 'response';
+    throw error;
+  } catch (error) {
+    error.stage = stage;
+    throw error;
   }
-
-  let contentType = 'application/json';
-  let payload = JSON.stringify(requestSpec.body);
-
-  if (requestSpec.transport === 'multipart') {
-    const multipart = buildMultipartBody(requestSpec);
-    contentType = multipart.contentType;
-    payload = multipart.payload;
-  }
-
-  const result = await request(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': contentType,
-      ...requestSpec.headers,
-    },
-  }, payload, REQUEST_TIMEOUT_MS);
-
-  const extracted = extractImages({ family, apiStyle }, result);
-  if (extracted.mode === 'async' || extracted.images.length > 0) {
-    return extracted;
-  }
-
-  throw new Error(`无法识别生成接口返回结构: ${truncateForLog(JSON.stringify(result), MAX_ERROR_SNIPPET)}`);
 }
 
 function pollDelayForAttempt(attemptIndex) {
@@ -248,12 +264,12 @@ async function pollTask(apiKey, baseUrl, taskId, options = {}) {
 
   while (true) {
     if (now() - start > TASK_TIMEOUT_MS) {
-      throw new Error(`任务超时（超过 ${TASK_TIMEOUT_MS}ms，已轮询 ${pollCount} 次）`);
+      throw Object.assign(new Error(`任务超时（超过 ${TASK_TIMEOUT_MS}ms，已轮询 ${pollCount} 次）`), { kind: 'task_timeout' });
     }
 
     let payload;
     try {
-      const result = await requestFn(`${baseUrl}/tasks/${taskId}`, {
+      const result = await requestFn(`${baseUrl}/tasks/${encodeURIComponent(taskId)}`, {
         headers: { Authorization: `Bearer ${apiKey}` },
       }, null, POLL_TIMEOUT_MS);
 
@@ -269,13 +285,14 @@ async function pollTask(apiKey, baseUrl, taskId, options = {}) {
       consecutiveFailures += 1;
 
       if (!classification.retryable || consecutiveFailures > MAX_POLL_FAILURES) {
-        // 不可重试（结构非法、鉴权失败），或连续失败过多：交给上层 fallback，避免无限轮询
+        // 查询失败保留原任务，不触发新的生成提交。
         throw markFallback(error, classification.kind);
       }
 
-      const delay = pollDelayForAttempt(consecutiveFailures - 1);
+      const delay = Number.isFinite(error.retryAfterMs) ? Math.max(0, error.retryAfterMs) : pollDelayForAttempt(consecutiveFailures - 1);
+      if (delay > 60000) throw error;
       const status = classification.statusCode ? ` ${classification.statusCode}` : '';
-      process.stderr.write(`任务查询失败（${classification.kind}${status}），${Math.round(delay / 1000)}s 后重试（连续失败 ${consecutiveFailures}/${MAX_POLL_FAILURES}）\n`);
+      process.stderr.write(`任务已提交，暂时无法获取最新进度。${Math.round(delay / 1000)} 秒后重新查询，不会重复生成（${consecutiveFailures}/${MAX_POLL_FAILURES}${status}）。\n`);
       await sleepFn(delay);
       continue;
     }
@@ -288,11 +305,11 @@ async function pollTask(apiKey, baseUrl, taskId, options = {}) {
       if (images.length > 0) {
         return images;
       }
-      throw new Error('任务已完成，但未找到图片结果');
+      throw Object.assign(new Error('任务已完成，但未找到图片结果'), { kind: 'task_empty', terminalTask: true });
     }
 
     if (FAILED_TASK_STATUSES.has(normalizedStatus)) {
-      throw new Error(payload.error?.message || `任务失败（status=${payload.status}）`);
+      throw Object.assign(new Error(payload.error?.message || `任务未完成（status=${payload.status}）`), { kind: 'task_failed', terminalTask: true });
     }
 
     // 少数站点不返回 status，直接把结果放在轮询响应里
@@ -688,10 +705,9 @@ async function saveImage(image, output, runDir, index = 0) {
       contentType = await downloadToFile(image.imageUrl, filePath);
     } catch (downloadError) {
       fs.rmSync(filePath, { force: true });
-      // 图片其实已经生成、钱已经花掉了，只是下载没成功。
-      // 这里必须标记成「不可重试、但可以换 profile」：重试提交等于重复计费。
+      // 已收到图片引用；下载失败不能据此推断账单，也不能重新提交生成。
       throw markFallback(
-        new Error(`图片已生成但下载失败（不会重试提交，避免重复计费）：${downloadError.message}`),
+        new Error(`已收到图片结果，但下载失败（不会重试提交）：${downloadError.message}`),
         'download',
       );
     }
@@ -721,7 +737,7 @@ async function saveImage(image, output, runDir, index = 0) {
 
 function parseArgs() {
   const args = process.argv.slice(2);
-  const parsed = { imageUrls: [], autoFallback: true };
+  const parsed = { imageUrls: [], autoFallback: true, profileFallback: false };
 
   // 取值并校验「后面确实跟着一个非 -- 的值」，避免缺值时后续 path.resolve / 读文件抛难懂的 TypeError
   const value = (index, flag) => {
@@ -762,13 +778,21 @@ function parseArgs() {
       case '--output': parsed.output = path.resolve(value(i++, '--output')); break;
       case '--out-dir': parsed.outDir = path.resolve(value(i++, '--out-dir')); break;
       case '--profile': parsed.profile = value(i++, '--profile'); break;
-      case '--no-fallback': parsed.autoFallback = false; break;
+      case '--no-fallback': parsed.autoFallback = false; parsed.profileFallback = false; break;
+      case '--no-model-fallback': parsed.autoFallback = false; break;
+      case '--no-profile-fallback': parsed.profileFallback = false; break;
+      case '--allow-profile-fallback': parsed.profileFallback = true; break;
+      case '--max-submissions': parsed.maxSubmissions = Number(value(i++, '--max-submissions')); break;
+      case '--resume': parsed.resume = path.resolve(value(i++, '--resume')); break;
       case '--json': parsed.json = true; break;
     }
   }
 
-  if (!parsed.prompt) {
-    console.error('用法: node generate.js --prompt "提示词" [--family openai|gemini|grok] [--api openai|official] [--model NAME] [--profile NAME] [--size SIZE] [--resolution 1k|2k|4k] [--image-size 512|1K|2K|4K] [--n COUNT] [--quality QUALITY] [--style STYLE] [--background auto] [--output-format png] [--output-compression 0-100] [--moderation auto] [--response-format url|b64_json] [--user USER] [--image-url URL] [--image-field FIELD] [--image-transport json|multipart] [--image-shape array|array-object|single] [--image-endpoint PATH] [--base-url URL] [--api-key KEY] [--output FILE | --out-dir DIR] [--json] [--no-fallback]');
+  if (args.includes('--no-fallback')) { parsed.autoFallback = false; parsed.profileFallback = false; }
+  if (args.includes('--no-profile-fallback')) parsed.profileFallback = false;
+  if (parsed.maxSubmissions !== undefined && (!Number.isInteger(parsed.maxSubmissions) || parsed.maxSubmissions < 1)) throw new Error('--max-submissions 必须是正整数');
+  if (!parsed.prompt && !parsed.resume) {
+    console.error('用法: node generate.js --prompt "提示词" [--family openai|gemini|grok|other] [--api openai|official] [--model NAME] [--profile NAME] [--size SIZE] [--resolution 1k|2k|4k] [--image-size 512|1K|2K|4K] [--n COUNT] [--quality QUALITY] [--style STYLE] [--background auto] [--output-format png] [--output-compression 0-100] [--moderation auto] [--response-format url|b64_json] [--user USER] [--image-url URL] [--image-field FIELD] [--image-transport json|multipart] [--image-shape array|array-object|single] [--image-endpoint PATH] [--base-url URL] [--api-key KEY] [--output FILE | --out-dir DIR] [--json] [--no-fallback] [--no-model-fallback] [--no-profile-fallback] [--allow-profile-fallback] [--max-submissions 3]；恢复：node generate.js --resume RECOVERY_JSON [--out-dir DIR] [--json]');
     console.error('图生图适配：--image-field 指定参考图字段名（默认 image_urls，multipart 默认 image）；--image-transport multipart 会把参考图作为文件字段上传；--image-endpoint 覆盖默认的 /images/generations 或 /images/edits。');
     process.exit(1);
   }
@@ -788,6 +812,10 @@ function resolveRuntimeConfig(cli) {
   const activeProfileName = config?.active_profile;
   const explicitProfile = cli.profile;
   const profiles = config?.profiles || {};
+  const requestedProfile = explicitProfile || activeProfileName;
+  if (requestedProfile && profiles[requestedProfile]?.enabled === false) {
+    throw new Error(`配置 ${requestedProfile} 已停用；请启用它或明确选择其他配置。`);
+  }
 
   // 安全提示：--base-url 覆盖站点地址后，若仍从 Keychain 取 key，会把该 key 发到新地址。
   // 这是「临时测试新站点」的合法用法，但要让用户知道代价，避免被诱导把真实 key 发到不可信主机。
@@ -816,7 +844,7 @@ function resolveRuntimeConfig(cli) {
 
   // --family / --api 是本次显式覆盖；没给就跟随 profile，profile 再没写就是 openai。
   // 默认全部走 OpenAI 兼容接口，Gemini / Grok 只有在用户明确指定时才发官方协议。
-  const cliFamily = cli.family ? normalizeFamily(cli.family) : null;
+  const cliFamily = cli.family ? (cli.family === 'other' ? 'other' : normalizeFamily(cli.family)) : null;
   const cliApiStyle = cli.apiStyle ? normalizeApiStyle(cli.apiStyle, cliFamily) : null;
 
   const profileFamily = (profile) => {
@@ -847,7 +875,9 @@ function resolveRuntimeConfig(cli) {
   // 否则会回落到 DEFAULT_BASE_URL 那个示例域名，把请求发错地方。
   const fallbackProfileName = explicitProfile || activeProfileName;
   const baseProfileConfig = fallbackProfileName ? profiles[fallbackProfileName] : null;
-  const manualFamily = cliFamily || (baseProfileConfig ? profileFamily(baseProfileConfig) : 'openai');
+  const baseSelection = getFamilyConfig(baseProfileConfig || {}, config || {});
+  const manualGroup = cliFamily || baseSelection.activeFamily || 'openai';
+  const manualFamily = baseProfileConfig && profileApiStyle(baseProfileConfig) === 'official' ? profileFamily(baseProfileConfig) : (manualGroup === 'other' ? 'openai' : manualGroup);
   const manualApiStyle = cliApiStyle || (baseProfileConfig ? profileApiStyle(baseProfileConfig, manualFamily) : 'openai');
 
   // 环境变量 IMAGES2_GEN_API_KEY 单独给出时也要能跑（文档承诺支持 CI 注入）。
@@ -859,7 +889,10 @@ function resolveRuntimeConfig(cli) {
     baseUrl: normalizeBaseUrl(cli.baseUrl || process.env.IMAGES2_GEN_BASE_URL || baseProfileConfig?.base_url || DEFAULT_BASE_URL),
     rootOutputDir: cli.outDir ? path.resolve(cli.outDir) : null,
     outputOverride: cli.output || null,
-    modelInput: baseProfileConfig?.model || null,
+    modelInput: baseSelection.modelFamilies[manualGroup]?.primary || null,
+    modelFallbackInputs: baseSelection.modelFamilies[manualGroup]?.fallbacks || [],
+    modelGroup: manualGroup,
+    missingGroup: Boolean(cliFamily && baseProfileConfig && !baseSelection.modelFamilies[manualGroup]?.primary),
     family: manualFamily,
     apiStyle: manualApiStyle,
     imageOptions: mergeImageOptions(baseProfileConfig),
@@ -867,7 +900,9 @@ function resolveRuntimeConfig(cli) {
   }] : [];
 
   const configCandidates = candidateProfiles.map(([name, profile]) => {
-    const declaredFamily = profileFamily(profile);
+    const selection = getFamilyConfig(profile, config);
+    const group = cliFamily || selection.activeFamily || 'openai';
+    const declaredFamily = profileApiStyle(profile) === 'official' ? profileFamily(profile) : (group === 'other' ? 'openai' : group);
     return {
       name,
       keychainAccount: profile.keychain_account,
@@ -875,7 +910,11 @@ function resolveRuntimeConfig(cli) {
       rootOutputDir: cli.outDir ? path.resolve(cli.outDir) : path.resolve(profile.resolved_root_output_dir || profile.root_output_dir || profile.output_dir || process.cwd()),
       outputOverride: cli.output || null,
       // profile 可以固定自己的模型；没有就跟随全局
-      modelInput: profile.model || null,
+      modelInput: selection.modelFamilies[group]?.primary || null,
+      modelGroup: group,
+      missingGroup: Boolean(cliFamily && !selection.modelFamilies[group]?.primary),
+      // 同一 profile 内的备用模型：站点/Key/协议/目录都一样，只是模型不同
+      modelFallbackInputs: selection.modelFamilies[group]?.fallbacks || [],
       // 这里用 profile 自己声明的族，--family 只用来过滤，不拿来改 profile 的身份
       family: declaredFamily,
       apiStyle: cliApiStyle || profileApiStyle(profile, declaredFamily),
@@ -884,26 +923,9 @@ function resolveRuntimeConfig(cli) {
     };
   });
 
-  // 用户点名了模型族或接口协议，就只留匹配的候选，避免把 Gemini 模型发给 OpenAI 网关
-  const matchesRequest = (candidate) => (
-    (!cliFamily || candidate.family === cliFamily)
-    && (!cliApiStyle || candidate.apiStyle === cliApiStyle)
-  );
-
   let candidates = manualCandidate.length > 0
-    ? (cli.autoFallback ? manualCandidate.concat(configCandidates) : manualCandidate)
-    : (cli.autoFallback ? configCandidates : configCandidates.slice(0, 1));
-
-  if (cliFamily || cliApiStyle) {
-    const filtered = candidates.filter(matchesRequest);
-    if (filtered.length === 0) {
-      throw new Error(
-        `没有匹配 family=${cliFamily || '*'} / api=${cliApiStyle || '*'} 的 profile。`
-        + '请先用 setup.js 添加对应配置，或去掉 --family / --api 让本次跟随 profile。',
-      );
-    }
-    candidates = filtered;
-  }
+    ? (cli.profileFallback ? manualCandidate.concat(configCandidates) : manualCandidate)
+    : (cli.profileFallback ? configCandidates : configCandidates.slice(0, 1));
 
   if (!candidates.length) {
     printSetupInstructions();
@@ -913,12 +935,20 @@ function resolveRuntimeConfig(cli) {
   // --model 是本次全局指定的，先解析一次：写错了就直接报错，不在每个候选上重复失败
   // 传完整 config，否则 --sync-models 拉回来的 discovered_models 在这里查不到，
   // 用户照着文档用 --model <拉到的ID> 会被判成「未知模型」。
-  const cliModelEntry = cli.model ? resolveModel(cli.model, config, cliFamily) : null;
+  const cliModelEntry = cli.model ? resolveProfileModel(cli.model, baseProfileConfig, config) : null;
 
   // base_url 不合法（拼错、用了非 http/https 协议）或固定了未知模型的 profile
   // 直接跳过，不拖垮整轮 fallback
   const usableCandidates = [];
   for (const candidate of candidates) {
+    if (!cliModelEntry && candidate.missingGroup) {
+      process.stderr.write(`跳过配置 ${candidate.name}：尚未设置 ${candidate.modelGroup} 的主模型。不会改用其他厂家。\n`);
+      continue;
+    }
+    if (cliModelEntry && profiles[candidate.name]?.synced_models?.length) {
+      try { resolveProfileModel(cliModelEntry.model, profiles[candidate.name], config); }
+      catch (error) { process.stderr.write(`跳过 profile=${candidate.name}：${error.message}\n`); continue; }
+    }
     try {
       assertValidBaseUrl(candidate.baseUrl);
     } catch (error) {
@@ -927,21 +957,39 @@ function resolveRuntimeConfig(cli) {
     }
 
     try {
-      candidate.model = resolveModelForProfile({
+      candidate.modelChain = resolveModelChainForProfile({
         cliModelEntry,
+        profile: profiles[candidate.name],
         profileModelKey: candidate.modelInput,
+        profileFallbackKeys: candidate.modelFallbackInputs,
         config,
-        family: candidate.family,
+        family: candidate.modelGroup || candidate.family,
+        // --no-fallback 的意思是「只跑当前这一条」，主备模型切换也一并关掉
+        allowModelFallback: cli.autoFallback,
+        warn: (message) => process.stderr.write(`${message}\n`),
       });
     } catch (error) {
       process.stderr.write(`跳过 profile=${candidate.name}：${error.message.split('\n')[0]}\n`);
       continue;
     }
 
+    if (candidate.apiStyle === 'official') {
+      const incompatible = candidate.modelChain.find(entry => entry.family && entry.family !== candidate.family);
+      if (incompatible) {
+        process.stderr.write(`跳过配置 ${candidate.name}：官方 ${candidate.family} 接口不能使用 ${incompatible.family} 模型 ${incompatible.model}。\n`);
+        continue;
+      }
+    }
+
+    // 保持旧字段：第一个就是首选模型，其他消费方（日志、提示）不用改
+    candidate.model = candidate.modelChain[0];
     usableCandidates.push(candidate);
   }
 
   if (!usableCandidates.length) {
+    if (cliFamily || candidates.some(candidate => candidate.missingGroup)) {
+      throw new Error(`没有可用配置设置 ${cliFamily || candidates[0]?.modelGroup || '当前厂家'} 的主模型；请在模型管理中配置该厂家，不会自动改用其他厂家。`);
+    }
     throw new Error('没有可用的 profile 可尝试，请运行 setup.js --health-check 检查配置。');
   }
 
@@ -963,6 +1011,7 @@ function buildLogRecordBase(cli, startedAt) {
     requested_model: cli.model || null,
     explicit_profile: cli.profile || null,
     auto_fallback: cli.autoFallback,
+    profile_fallback: cli.profileFallback === true,
   };
 }
 
@@ -1013,38 +1062,120 @@ async function runCandidate(candidate, cli, runRecord, options = {}) {
     }
   }
 
-  const attempt = {
-    profile: candidate.name,
-    base_url: candidate.baseUrl,
-    family: candidate.family,
-    api_style: candidate.apiStyle,
-    model: candidate.model.model,
-    model_key: candidate.model.key,
-    model_source: candidate.model.source,
-    // 图生图适配信息按候选记入 attempt，日后排查 400 能看出当时用的字段名/传输方式
-    image_options: imageOptionsLabel,
-    started_at: attemptStartedAt.toISOString(),
-  };
-
   let candidateApiKey;
   try {
     candidateApiKey = candidate.apiKey || readKeychainSecret(candidate.keychainAccount);
   } catch (error) {
     // Keychain 读不到 key 只说明这一个 profile 不可用，应该交给上层 fallback，而不是整轮退出
-    attempt.status = 'failed';
-    attempt.last_error = truncateForLog(error.message, MAX_LOG_ERROR_LENGTH);
-    attempt.error_kind = 'keychain';
-    attempt.completed_at = new Date().toISOString();
-    attempt.duration_ms = Date.now() - attemptStartedAt.getTime();
-    runRecord.attempts.push({ ...attempt });
+    runRecord.attempts.push({
+      profile: candidate.name,
+      base_url: candidate.baseUrl,
+      family: candidate.family,
+      api_style: candidate.apiStyle,
+      model: candidate.model.model,
+      model_key: candidate.model.key,
+      model_source: candidate.model.source,
+      image_options: imageOptionsLabel,
+      started_at: attemptStartedAt.toISOString(),
+      status: 'failed',
+      last_error: truncateForLog(error.message, MAX_LOG_ERROR_LENGTH),
+      error_kind: 'keychain',
+      completed_at: new Date().toISOString(),
+      duration_ms: Date.now() - attemptStartedAt.getTime(),
+    });
     throw markFallback(error, 'keychain');
   }
 
+  // 同一 profile 内的主备模型链：站点/Key/协议/输出目录都一样，只有模型不同。
+  const chain = Array.isArray(candidate.modelChain) && candidate.modelChain.length > 0
+    ? candidate.modelChain
+    : [candidate.model];
+  runRecord.model_chain = chain.map((entry) => entry.model);
+
+  if (chain.length > 1) {
+    process.stderr.write(
+      `主模型：${chain[0].model}；备选：${chain.slice(1).map((entry) => entry.model).join('、')}（仅在主模型明确不可用时尝试）\n`,
+    );
+  }
+
+  let lastError = null;
+  for (let modelIndex = 0; modelIndex < chain.length; modelIndex += 1) {
+    const modelEntry = chain[modelIndex];
+    try {
+      return await runModelAttempt({
+        candidate,
+        modelEntry,
+        cli,
+        runRecord,
+        candidateApiKey,
+        imageOptionsLabel,
+        attemptStartedAt,
+        sleepFn,
+      });
+    } catch (error) {
+      lastError = error;
+      const classification = classifyError(error, { idempotent: false });
+      const nextEntry = chain[modelIndex + 1];
+
+      // 换模型会再次提交，仅对明确的模型拒绝尝试备选。
+      const canSwitchModel = Boolean(nextEntry)
+        && classification.kind === 'model'
+        && classification.fallback
+        && classification.resubmittable !== false;
+
+      if (!canSwitchModel) {
+        error.modelsExhausted = modelIndex > 0;
+        throw error;
+      }
+
+      process.stderr.write(
+        `${modelEntry.model} 暂不可用，正在尝试你设置的备选 ${nextEntry.model}。\n`,
+      );
+    }
+  }
+
+  throw lastError;
+}
+
+/**
+ * 在单个 profile + 单个模型上跑一次完整的「提交 + 回收 + 落盘」，含同模型内的退避重试。
+ * 拆出来是为了让 runCandidate 能在主备模型之间循环，同时让每次尝试都能单独落日志。
+ */
+async function runModelAttempt({
+  candidate,
+  modelEntry,
+  cli,
+  runRecord,
+  candidateApiKey,
+  imageOptionsLabel,
+  attemptStartedAt,
+  sleepFn,
+}) {
+  const attempt = {
+    profile: candidate.name,
+    base_url: candidate.baseUrl,
+    family: candidate.family,
+    model_family: modelEntry.family || candidate.modelGroup || candidate.family,
+    api_style: candidate.apiStyle,
+    model: modelEntry.model,
+    model_key: modelEntry.key,
+    model_source: modelEntry.source,
+    // 图生图适配信息按候选记入 attempt，日后排查 400 能看出当时用的字段名/传输方式
+    image_options: imageOptionsLabel,
+    started_at: attemptStartedAt.toISOString(),
+  };
+
+  if (candidate.apiStyle === 'official' && modelEntry.family && modelEntry.family !== candidate.family) {
+    const error = new Error('该模型需要不同的官方接口协议；请使用 OpenAI 兼容接口，或为它建立对应官方接口配置。');
+    error.generationClassification = { kind: 'interface', statusCode: null, retryable: false, fallback: false, resubmittable: false };
+    error.stage = 'preflight';
+    throw error;
+  }
   const mode = cli.imageUrls.length > 0 ? '图生图' : '文生图';
   const interfaceLabel = candidate.apiStyle === 'official' ? `${candidate.family} 官方接口` : 'OpenAI 兼容接口';
-  process.stderr.write(`正在提交${mode}任务: profile=${candidate.name}, 接口=${interfaceLabel}, base_url=${candidate.baseUrl}, model=${candidate.model.model}, prompt=${cli.prompt}, size=${cli.size || '默认'}\n`);
-  if (candidate.model.source === 'default') {
-    process.stderr.write(`提示：当前使用默认模型 ${candidate.model.model}，可用 setup.js --model 切换。\n`);
+  process.stderr.write(`正在提交${mode}任务: profile=${candidate.name}, 接口=${interfaceLabel}, base_url=${candidate.baseUrl}, model=${modelEntry.model}, prompt=${cli.prompt}, size=${cli.size || '默认'}\n`);
+  if (modelEntry.source === 'default') {
+    process.stderr.write(`提示：当前使用默认模型 ${modelEntry.model}，可用 manage.js 管理厂家分组和模型顺序。\n`);
   }
   if (cli.imageUrls.length > 0) {
     // 图生图时把适配结果说清楚，否则用户遇到 400 很难判断是字段名还是传输方式不对
@@ -1053,7 +1184,7 @@ async function runCandidate(candidate, cli, runRecord, options = {}) {
 
   const params = {
     prompt: cli.prompt,
-    model: candidate.model.model,
+    model: modelEntry.model,
     size: cli.size,
     resolution: cli.resolution,
     imageSize: cli.imageSize,
@@ -1067,23 +1198,60 @@ async function runCandidate(candidate, cli, runRecord, options = {}) {
     responseFormat: cli.responseFormat,
     user: cli.user,
     imageUrls: cli.imageUrls,
-    // 让 providers 层能把「4K 已降级到 2k」这类调整回传给用户
+    // 将供应商参数提示回传给用户。
     warn: (message) => process.stderr.write(`${message}\n`),
   };
 
+  const runDir = candidate.outputOverride
+    ? path.dirname(candidate.outputOverride)
+    : buildRunDir(candidate.rootOutputDir || process.cwd(), attemptStartedAt);
+  try {
+    ensureDir(runDir);
+    fs.accessSync(runDir, fs.constants.W_OK);
+    const probe = path.join(runDir, `.oh-coage-write-${crypto.randomBytes(8).toString('hex')}`);
+    fs.writeFileSync(probe, '', { flag: 'wx', mode: 0o600 });
+    fs.unlinkSync(probe);
+  } catch (error) {
+    error.stage = 'preflight';
+    throw error;
+  }
+  const recoveryPath = path.join(runDir, `recovery-${crypto.randomBytes(8).toString('hex')}.json`);
+  const recovery = { version: 1, status: 'submitting', profile: candidate.name, baseUrl: candidate.baseUrl,
+    keychainAccount: candidate.keychainAccount || null, model: modelEntry.model,
+    output: candidate.outputOverride || null, requestedCount: Number(cli.n) || 1,
+    runDir, taskId: null, images: [], saved: {} };
+  const persistRecovery = () => {
+    const temp = `${recoveryPath}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(recovery, null, 2), { mode: 0o600 });
+    fs.renameSync(temp, recoveryPath);
+  };
+  try { persistRecovery(); } catch (error) { error.stage = 'preflight'; throw error; }
+  process.stderr.write(`本次记录: ${recoveryPath}\n`);
+  let accepted = false;
   let lastError = null;
   for (let index = 1; index <= MAX_RETRY_ATTEMPTS; index++) {
     attempt.try_count = index;
     try {
+      const limit = cli.maxSubmissions || 3;
+      runRecord.submission_count ||= 0;
+      if (runRecord.submission_count >= limit) throw Object.assign(new Error(`已达到本次提交上限 ${limit}；请检查尝试记录后再决定是否继续`), { kind: 'budget' });
+      runRecord.submission_count += 1;
       const submitted = await submitGeneration({
         apiKey: candidateApiKey,
         baseUrl: candidate.baseUrl,
-        family: candidate.family,
+        family: candidate.apiStyle === 'official'
+          ? candidate.family
+          : (modelEntry.family && modelEntry.family !== 'other' ? modelEntry.family : (candidate.modelGroup === 'other' ? 'openai' : candidate.modelGroup || candidate.family)),
         apiStyle: candidate.apiStyle,
         imageOptions: candidate.imageOptions,
         params,
       });
+      accepted = true;
       attempt.response_mode = submitted.mode;
+      recovery.status = 'accepted';
+      recovery.taskId = submitted.taskId || null;
+      recovery.images = submitted.images || [];
+      persistRecovery();
 
       let images;
       if (submitted.mode === 'async') {
@@ -1098,15 +1266,17 @@ async function runCandidate(candidate, cli, runRecord, options = {}) {
         images = submitted.images;
       }
 
-      const runDir = candidate.outputOverride
-        ? null
-        : buildRunDir(candidate.rootOutputDir || process.cwd(), attemptStartedAt);
+      recovery.images = images;
+      recovery.status = 'saving';
+      persistRecovery();
       const savedPaths = [];
       const results = [];
       for (let imageIndex = 0; imageIndex < images.length; imageIndex++) {
         const image = images[imageIndex];
         const savedPath = await saveImage(image, candidate.outputOverride, runDir, imageIndex);
         if (savedPath) savedPaths.push(savedPath);
+        recovery.saved[imageIndex] = savedPath;
+        persistRecovery();
         results.push({
           savedPath: savedPath || null,
           // 远程 URL 原样保留；base64 落盘后靠本地路径展示
@@ -1117,6 +1287,8 @@ async function runCandidate(candidate, cli, runRecord, options = {}) {
       }
       const savedPath = savedPaths[0] || null;
 
+      recovery.status = 'complete';
+      persistRecovery();
       attempt.status = 'success';
       attempt.completed_at = new Date().toISOString();
       attempt.duration_ms = Date.now() - attemptStartedAt.getTime();
@@ -1128,10 +1300,11 @@ async function runCandidate(candidate, cli, runRecord, options = {}) {
         prompt: cli.prompt,
         profile: candidate.name,
         base_url: candidate.baseUrl,
-        family: candidate.family,
+        family: modelEntry.family || candidate.modelGroup || candidate.family,
+        api_family: candidate.family,
         api_style: candidate.apiStyle,
-        model: candidate.model.model,
-        model_key: candidate.model.key,
+        model: modelEntry.model,
+        model_key: modelEntry.key,
         size: cli.size || null,
         resolution: cli.resolution || null,
         image_size: cli.imageSize || null,
@@ -1147,12 +1320,23 @@ async function runCandidate(candidate, cli, runRecord, options = {}) {
       });
 
       runRecord.attempts.push(attempt);
-      return { attempt, savedPath, savedPaths, runDir, images, results };
+      return { attempt, savedPath, savedPaths, runDir, images, results, model: modelEntry };
     } catch (error) {
       lastError = error;
+      if (accepted) error.generationAccepted = true;
+      recovery.status = error.generationAccepted ? 'recoverable' : 'failed_or_unknown';
+      if (Object.keys(recovery.saved).length) process.stderr.write(`已保存图片保留: ${Object.values(recovery.saved).filter(Boolean).join('、')}\n`);
+      recovery.lastError = truncateForLog(error.message, MAX_LOG_ERROR_LENGTH);
+      try { persistRecovery(); } catch (recordError) {
+        process.stderr.write(`本次记录更新失败：${truncateForLog(recordError.message)}；已保留先前记录。\n`);
+      }
+      const failureClassification = classifyError(error, { idempotent: false });
+      error.generationClassification = failureClassification;
+      error.definitelyRejected = failureClassification.resubmittable || ['quota', 'auth', 'permission', 'content', 'model', 'parameters', 'rate_limit', 'tls'].includes(failureClassification.kind);
+      error.recovery = { path: recoveryPath, taskId: recovery.taskId, images: recovery.images.length, saved: recovery.saved };
       // 这里是提交（非幂等 POST）。超时/连接重置时服务端可能已经生成并计费，
-      // 所以只对「确定没送达」和「服务端明确报错」的情况重试，其余直接换 profile。
-      const classification = classifyError(error, { idempotent: false });
+      // 所以只对明确未送达或限流的情况重试，其余保留恢复记录。
+      const classification = failureClassification;
       attempt.status = 'failed';
       attempt.last_error = truncateForLog(error.message, MAX_LOG_ERROR_LENGTH);
       attempt.error_kind = classification.kind;
@@ -1163,9 +1347,18 @@ async function runCandidate(candidate, cli, runRecord, options = {}) {
       // retryable 覆盖限流、明确失败的上游故障，以及「连接根本没建起来」的网络错误，
       // 统一在同 profile 上退避重试一次
       if (classification.retryable && index < MAX_RETRY_ATTEMPTS) {
-        const delay = retryDelayFor(classification.kind, index);
+        const requestedDelay = Number.isFinite(error.retryAfterMs) ? Math.max(0, error.retryAfterMs) : retryDelayFor(classification.kind, index);
+        if (requestedDelay > 60000) {
+          error.message += '；服务要求等待超过 60 秒，请稍后重试';
+          error.generationClassification = { ...classification, retryable: false, fallback: false, resubmittable: false };
+          runRecord.attempts.push({ ...attempt });
+          throw error;
+        }
+        const delay = requestedDelay;
         const status = classification.statusCode ? ` ${classification.statusCode}` : '';
-        process.stderr.write(`遇到 ${classification.kind}${status}，${delay}ms 后重试当前 profile...\n`);
+        process.stderr.write(classification.kind === 'rate_limit'
+          ? `当前请求较多，${Math.ceil(delay / 1000)} 秒后重试当前模型（${index}/${MAX_RETRY_ATTEMPTS}）${status}。\n`
+          : `暂时连接不上生图服务，${Math.ceil(delay / 1000)} 秒后重试（${index}/${MAX_RETRY_ATTEMPTS}）。\n`);
         await sleepFn(delay);
         continue;
       }
@@ -1178,24 +1371,95 @@ async function runCandidate(candidate, cli, runRecord, options = {}) {
   throw lastError;
 }
 
+async function resumeGeneration(cli) {
+  let recovery;
+  try {
+    return await resumeGenerationRecord(cli, (record) => { recovery = record; });
+  } catch (error) {
+    error.stage = 'resume';
+    error.kind ||= recovery?.images?.length ? 'download' : recovery?.taskId ? 'recovery' : 'resume';
+    if (recovery) {
+      error.generationAccepted = Boolean(recovery.taskId || recovery.images?.length);
+      error.recovery = { path: cli.resume, taskId: recovery.taskId, images: recovery.images?.length || 0, saved: recovery.saved };
+    }
+    throw error;
+  }
+}
+
+async function resumeGenerationRecord(cli, onRecord) {
+  const recoveryPath = cli.resume;
+  const recovery = JSON.parse(fs.readFileSync(recoveryPath, 'utf8'));
+  if (recovery.version !== 1 || !recovery.runDir || !recovery.baseUrl) throw new Error('恢复记录格式无效');
+  if (recovery.images !== undefined && !Array.isArray(recovery.images)) throw new Error('恢复记录的图片列表无效');
+  onRecord(recovery);
+  const persist = () => {
+    const temp = `${recoveryPath}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(recovery, null, 2), { mode: 0o600 });
+    fs.renameSync(temp, recoveryPath);
+  };
+  assertValidBaseUrl(recovery.baseUrl);
+  if (!recovery.images?.length && recovery.taskId) {
+    let key = cli.apiKey || process.env.IMAGES2_GEN_API_KEY;
+    if (!key) {
+      const { config } = loadActiveConfig();
+      const profile = config?.profiles?.[recovery.profile];
+      if (!profile || normalizeBaseUrl(profile.base_url) !== recovery.baseUrl) throw new Error('原配置已变更；请恢复原站点连接，或通过 IMAGES2_GEN_API_KEY 提供原站点密钥后继续查询');
+      key = readKeychainSecret(profile.keychain_account);
+    }
+    recovery.images = await pollTask(key, recovery.baseUrl, recovery.taskId);
+    persist();
+  }
+  if (!recovery.images?.length) throw Object.assign(new Error('提交结果未知且没有任务 ID。请检查服务端记录；不会自动重新生成。'), { kind: 'no_recovery' });
+  if (cli.outDir) recovery.runDir = cli.outDir;
+  if (cli.output) recovery.output = cli.output;
+  ensureDir(recovery.runDir);
+  recovery.saved ||= {};
+  persist();
+  const results = [];
+  for (let index = 0; index < recovery.images.length; index++) {
+    const image = recovery.images[index];
+    let savedPath = recovery.saved[index];
+    if (!savedPath || !fs.existsSync(savedPath)) {
+      savedPath = await saveImage(image, cli.output || recovery.output, cli.outDir || recovery.runDir, index);
+      recovery.saved[index] = savedPath;
+      persist();
+    }
+    results.push({ path: savedPath, display: savedPath, url: image.imageUrl || null });
+  }
+  recovery.status = 'complete';
+  persist();
+  const requestedCount = Number(recovery.requestedCount) || results.length;
+  const missingCount = Math.max(0, requestedCount - results.length);
+  if (missingCount) process.stderr.write(`已完成 ${results.length}/${requestedCount} 张，图片已保存；其余图片尚未返回，不会自动补发生成请求。\n`);
+  if (cli.json) console.log(JSON.stringify({ status: missingCount ? 'partial' : 'success', resumed: true, model: recovery.model, requested_count: requestedCount, received_count: results.length, missing_count: missingCount, run_dir: recovery.runDir, images: results }));
+  else results.forEach((image) => console.log(image.path));
+}
+
 async function main() {
   const cli = parseArgs();
+  if (cli.resume) return resumeGeneration(cli);
   if (cli.apiKey) {
     process.stderr.write('提示：--api-key 的密钥会短暂出现在进程列表（ps 可见）。介意请改用 IMAGES2_GEN_API_KEY 环境变量。\n');
   }
   // CLI 上的图生图适配项先验一遍，拼错时立刻报错而不是等每个候选都失败
-  cli.imageOptions = {
-    imageField: normalizeImageField(cli.imageField),
-    imageTransport: normalizeImageTransport(cli.imageTransport),
-    imageShape: normalizeImageShape(cli.imageShape),
-    imageEndpoint: cli.imageEndpoint || null,
-  };
-  if (cli.imageUrls.length === 0
-    && (cli.imageField || cli.imageTransport || cli.imageShape || cli.imageEndpoint)) {
-    process.stderr.write('提示：没有提供 --image-url，本次是文生图，参考图适配项不会生效。\n');
+  let runtime;
+  try {
+    cli.imageOptions = {
+      imageField: normalizeImageField(cli.imageField),
+      imageTransport: normalizeImageTransport(cli.imageTransport),
+      imageShape: normalizeImageShape(cli.imageShape),
+      imageEndpoint: cli.imageEndpoint || null,
+    };
+    if (cli.imageUrls.length === 0
+      && (cli.imageField || cli.imageTransport || cli.imageShape || cli.imageEndpoint)) {
+      process.stderr.write('提示：没有提供 --image-url，本次是文生图，参考图适配项不会生效。\n');
+    }
+    cli.imageUrls = normalizeImageReferences(cli.imageUrls);
+    runtime = resolveRuntimeConfig(cli);
+  } catch (error) {
+    error.stage = 'preflight';
+    throw error;
   }
-  cli.imageUrls = normalizeImageReferences(cli.imageUrls);
-  const runtime = resolveRuntimeConfig(cli);
   const startedAt = new Date();
   const runRecord = {
     ...buildLogRecordBase(cli, startedAt),
@@ -1208,21 +1472,32 @@ async function main() {
     try {
       const result = await runCandidate(candidate, cli, runRecord);
       const completedAt = new Date();
-      runRecord.status = 'success';
+      // 成功的那次可能是备用模型，日志和输出要记实际用的那个，而不是首选
+      const usedModel = result.model || candidate.model;
+      const results = result.results || [];
+      const requestedCount = Number(cli.n) || 1;
+      const missingCount = Math.max(0, requestedCount - results.length);
+      runRecord.status = missingCount ? 'partial' : 'success';
+      runRecord.requested_count = requestedCount;
+      runRecord.received_count = results.length;
       runRecord.completed_at = completedAt.toISOString();
       runRecord.duration_ms = completedAt.getTime() - startedAt.getTime();
       runRecord.selected_profile = candidate.name;
-      runRecord.family = candidate.family;
+      runRecord.family = usedModel.family || candidate.modelGroup || candidate.family;
+      runRecord.api_family = candidate.family;
       runRecord.api_style = candidate.apiStyle;
-      runRecord.model = candidate.model.model;
-      runRecord.model_key = candidate.model.key;
-      runRecord.model_source = candidate.model.source;
+      runRecord.model = usedModel.model;
+      runRecord.model_key = usedModel.key;
+      runRecord.model_source = usedModel.source;
       runRecord.saved_path = result.savedPath || null;
       runRecord.saved_paths = result.savedPaths || [];
       runRecord.run_dir = result.runDir || null;
       writeRunLog(runRecord);
 
-      const results = result.results || [];
+      if (missingCount) process.stderr.write(`已完成 ${results.length}/${requestedCount} 张，图片已保存；其余图片尚未返回，不会自动补发生成请求。\n`);
+      if (usedModel.source === 'fallback') {
+        process.stderr.write(`本次首选模型不可用，已自动用备用模型生成：${usedModel.model}\n`);
+      }
       if (result.runDir) {
         process.stderr.write(`图片目录: ${result.runDir}\n`);
       }
@@ -1233,11 +1508,19 @@ async function main() {
       if (cli.json) {
         // 给调用方一份完整结构：URL 和 base64 两种返回都能落到可展示的引用
         console.log(JSON.stringify({
-          status: 'success',
+          status: runRecord.status,
+          requested_count: requestedCount,
+          received_count: results.length,
+          missing_count: missingCount,
           profile: candidate.name,
-          family: candidate.family,
+          family: usedModel.family || candidate.modelGroup || candidate.family,
+          api_family: candidate.family,
           api: candidate.apiStyle,
-          model: candidate.model.model,
+          model: usedModel.model,
+          model_key: usedModel.key,
+          model_source: usedModel.source,
+          // 用了备用模型时告诉调用方，便于向用户解释为什么模型变了
+          used_fallback_model: usedModel.source === 'fallback',
           run_dir: result.runDir || null,
           images: results.map((item) => ({
             source: item.source,
@@ -1270,8 +1553,8 @@ async function main() {
 
       throw new Error('生成成功但没有任何可用的图片结果。');
     } catch (error) {
-      const classification = classifyError(error);
-      const shouldFallback = classification.fallback && index < runtime.candidates.length - 1;
+      const classification = classifyError(error, { idempotent: false });
+      const shouldFallback = classification.fallback && classification.resubmittable !== false && index < runtime.candidates.length - 1;
 
       if (shouldFallback) {
         process.stderr.write(`当前 profile=${candidate.name} 失败（${classification.kind}${classification.statusCode ? ` ${classification.statusCode}` : ''}），切换到下一个 profile...\n`);
@@ -1282,13 +1565,17 @@ async function main() {
       runRecord.status = 'failed';
       runRecord.completed_at = failedAt.toISOString();
       runRecord.duration_ms = failedAt.getTime() - startedAt.getTime();
-      runRecord.model = candidate.model.model;
-      runRecord.model_key = candidate.model.key;
-      runRecord.model_source = candidate.model.source;
+      // 失败时记录真正最后试过的模型（可能是备用模型），而不是链首的首选
+      const lastAttempt = runRecord.attempts[runRecord.attempts.length - 1];
+      runRecord.model = lastAttempt?.model || candidate.model.model;
+      runRecord.model_key = lastAttempt?.model_key || candidate.model.key;
+      runRecord.model_source = lastAttempt?.model_source || candidate.model.source;
       runRecord.final_error = truncateForLog(error.message, MAX_LOG_ERROR_LENGTH);
       runRecord.final_error_kind = classification.kind;
       runRecord.final_status_code = classification.statusCode;
-      writeRunLog(runRecord);
+      try { writeRunLog(runRecord); } catch (logError) {
+        process.stderr.write(`日志保存失败：${truncateForLog(logError.message)}；请以本次错误与已有图片记录为准。\n`);
+      }
       throw error;
     }
   }
@@ -1303,6 +1590,7 @@ if (process.env.OH_COAGE_TEST === '1') {
     pollDelayForAttempt,
     pollTask,
     runCandidate,
+    runModelAttempt,
     classifyError,
     truncateForLog,
     inferExtensionFromUrl,
@@ -1313,7 +1601,7 @@ if (process.env.OH_COAGE_TEST === '1') {
   };
 } else {
   main().catch((error) => {
-    console.error(`错误：${error.message}`);
+    console.error(formatGenerationError(error, classifyError(error, { idempotent: false })));
     process.exit(1);
   });
 }

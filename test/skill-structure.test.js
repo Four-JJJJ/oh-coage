@@ -42,7 +42,7 @@ test('every $SKILL_DIR path in the authoritative doc points at a real file', () 
   }
 });
 
-test('the authoritative doc keeps the text path as baseline and gates the form behind capability checks', () => {
+test('the authoritative doc defaults to forms with a capability-gated text fallback', () => {
   const source = fs.readFileSync(skillDocPath, 'utf8');
 
   assert.doesNotMatch(source, /\$SKILL_DIR\/\.\.\//, '不应再使用 $SKILL_DIR/../ 这种越出 skill 目录的路径');
@@ -119,7 +119,7 @@ test('the authoritative doc spells out the model-switching flow', () => {
 function parseFlags(scriptPath) {
   const source = fs.readFileSync(scriptPath, 'utf8');
   const flags = new Set();
-  for (const match of source.matchAll(/case '(--[a-z-]+)'/g)) {
+  for (const match of source.matchAll(/(?:case\s+|command\s*===\s*|argv\.includes\()(?:'|")(--[a-z-]+)(?:'|")/g)) {
     flags.add(match[1]);
   }
   return flags;
@@ -146,6 +146,8 @@ test('the doc does not invent flags that the scripts do not support', () => {
   const supported = new Set([
     ...parseFlags(path.join(skillDir, 'scripts', 'generate.js')),
     ...parseFlags(path.join(skillDir, 'scripts', 'setup.js')),
+    ...parseFlags(path.join(skillDir, 'scripts', 'onboarding.js')),
+    ...parseFlags(path.join(skillDir, 'scripts', 'manage.js')),
   ]);
 
   // 只检查「看起来像 CLI flag」且带反引号的行内代码
@@ -198,4 +200,37 @@ test('the README model count matches the built-in registry', () => {
   // README 声称「9 个内置模型」，注册表变了这里就要跟着改
   assert.match(readme, new RegExp(`${ALL_BUILTIN_MODELS.length} 个内置模型`),
     `README 的内置模型数量与注册表（${ALL_BUILTIN_MODELS.length} 个）不一致`);
+});
+
+// ---------------------------------------------------------------------------
+// 主备模型流程：文档必须说清「首选 + 备用写在同一个 profile」
+// ---------------------------------------------------------------------------
+
+test('the authoritative doc makes model selection part of initialization', () => {
+  const source = fs.readFileSync(skillDocPath, 'utf8');
+
+  assert.match(source, /### 初始化后的模型选择（必做）/, '初始化后必须有模型选择步骤');
+  assert.match(source, /onboarding.js --complete/, '初始化使用两步脚本保存');
+  assert.match(source, /--primary-model/, '应让用户选首选模型');
+  assert.match(source, /--fallback-model/, '应让用户选备用模型');
+  assert.match(source, /同一个 profile/, '主备必须写在同一个 profile 里');
+});
+
+test('the authoritative doc spells out the in-profile fallback semantics', () => {
+  const source = fs.readFileSync(skillDocPath, 'utf8');
+
+  assert.match(source, /### 主备模型（同一个 profile 内）/, '应有一节说明主备模型');
+  assert.match(source, /fallback_models/, '应说明写入的配置字段');
+  assert.match(source, /不会.*换模型|不换模型/, '必须说明哪些错误不换模型（避免重复计费）');
+  assert.match(source, /--clear-fallback-models/, '应说明如何清除备用模型');
+});
+
+test('the README documents the primary/fallback profile fields', () => {
+  const readme = fs.readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
+
+  assert.match(readme, /### 主备模型：首选 \+ 备用写在同一个 profile 里/);
+  assert.match(readme, /profile\.fallback_models/);
+  assert.match(readme, /--primary-model/);
+  assert.match(readme, /--fallback-model/);
+  assert.match(readme, /used_fallback_model/);
 });

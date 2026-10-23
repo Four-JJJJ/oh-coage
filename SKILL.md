@@ -1,6 +1,8 @@
 ---
 name: oh-coage
-description: 使用可配置站点或官方接口生成图片，支持 OpenAI 兼容、Gemini（Nano Banana）与 Grok Imagine 三类模型，默认全部走 OpenAI 兼容生图接口，也可按用户要求切换到 Gemini / Grok 官方接口。支持文生图、图生图、模型切换、按 URL + Key 拉取可用模型、多 profile 保存与 fallback。当用户说"生图"、"画图"、"生成图片"、"oh-coage"、"gpt-image"、"Image2 生图"、"帮我画"、"用 gpt 画"、"用 2.5 画"、"用 banana 画"、"用 grok 画"、"切换模型"、"换模型"、"换个模型"、"改成 xxx 模型"、"使用 xxx 模型"、"有哪些模型"、"拉取模型"、"用官方接口"、"把这张图改成"、"参考这张图"等涉及 AI 图片生成、图片编辑、模型或接口切换的请求时触发此技能。生成结果应直接在对话中展示图片，兼容接口返回 URL 与 base64 两种情况。首次使用时先做本地初始化：收集 profile 名、站点 URL 和 API Key（图片目录非必填，自动落到项目目录或桌面）；支持聊天问答和可视化表单两种初始化方式；Key 写入本机 Keychain，本地配置文件只保存非敏感信息。
+description: 使用可配置站点生成图片，默认发送 OpenAI Images 生图请求，也支持用户明确指定 Gemini / Grok 等厂家原生协议。支持文生图、图生图、模型切换、按 URL + Key 拉取可用模型、多 profile 保存与 fallback。当用户说"生图"、"画图"、"生成图片"、"oh-coage"、"gpt-image"、"Image2 生图"、"帮我画"、"用 gpt 画"、"用 2.5 画"、"用 banana 画"、"用 grok 画"、"切换模型"、"换模型"、"换个模型"、"改成 xxx 模型"、"使用 xxx 模型"、"有哪些模型"、"拉取模型"、"用官方接口"、"把这张图改成"、"参考这张图"等涉及 AI 图片生成、图片编辑、模型或接口切换的请求时触发此技能。生成结果应直接在对话中展示图片，兼容接口返回 URL 与 base64 两种情况。首次使用时先做本地初始化：收集 profile 名、站点 URL 和 API Key（图片目录非必填，自动落到项目目录或桌面）；默认固定两步可视化表单，文字会话兜底；验证站点后全量拉取模型，按厂家设置主模型与可选的一个备选，同一 profile 保存各厂家配置和默认厂家；Key 写入本机 Keychain，本地配置文件只保存非敏感信息。
+metadata:
+  version: "0.11.0"
 ---
 
 # oh-coage（入口指针）
@@ -26,6 +28,6 @@ node "$SKILL_DIR/skills/oh-coage/scripts/generate.js" # 生成图片
 
 请注意：读取 `skills/oh-coage/SKILL.md` 时，**要把 `skills/oh-coage/` 视为那份文档里的 `$SKILL_DIR`**，而不是本仓库根目录。否则其中的 `$SKILL_DIR/scripts/...` 会解析错。
 
-如果安装方式本来就是「`skills/oh-coage/` 即 skill 目录」（Codex 插件安装，或把该子目录单独软链到 skills 目录），那就不需要本文件，直接用那份文档即可，其中 `$SKILL_DIR/scripts/...` 天然正确。
+如果安装方式本来就是「`skills/oh-coage/` 即 skill 目录」（把该子目录整体复制或软链到宿主的 skills 目录），那就不需要本文件，直接用那份文档即可，其中 `$SKILL_DIR/scripts/...` 天然正确。
 
 不要在本文档里补充任何流程说明。

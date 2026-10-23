@@ -195,7 +195,7 @@ test('pollTask treats canceled/error as terminal failures instead of polling to 
       request: async () => ({ data: { status: 'canceled' } }),
       sleep: async () => { throw new Error('不该 sleep'); },
     }),
-    /任务失败（status=canceled）/,
+    /任务未完成（status=canceled）/,
   );
 });
 
@@ -219,6 +219,8 @@ test('classifyError honours the explicit fallback marker used by the Keychain pa
     statusCode: null,
     retryable: false,
     fallback: true,
+    // Keychain 读不到 key 时请求根本没发出，换模型/换 profile 都不会重复计费
+    resubmittable: true,
   });
 });
 
@@ -238,7 +240,7 @@ test('inferExtensionFromUrl ignores query strings and normalizes jpeg', () => {
   assert.equal(generate.inferExtensionFromUrl('not a url'), null);
 });
 
-test('a transient 5xx is retried on the same profile before giving up', async (t) => {
+test('an uncertain 5xx is not resubmitted', async (t) => {
   const tempDir = createTempDir();
   const home = createTempDir();
   t.after(() => {
@@ -275,10 +277,10 @@ test('a transient 5xx is retried on the same profile before giving up', async (t
     '--no-fallback',
   ], home, { OH_COAGE_RETRY_DELAY_MS: '0' });
 
-  assert.equal(result.code, 0, result.stderr);
-  assert.equal(attempts, 2, '第一次 502 后应在同一 profile 上重试');
-  assert.match(result.stderr, /遇到 upstream 502/);
-  assert.ok(result.stdout.trim().startsWith(tempDir), result.stdout);
+  assert.equal(result.code, 1, result.stderr);
+  assert.equal(attempts, 1, '502 不能证明请求没有被计费');
+  assert.match(result.stderr, /本次记录/);
+  assert.doesNotMatch(result.stderr, /--resume/);
 });
 
 test('a profile whose Keychain entry is missing falls back instead of aborting the run', async (t) => {
@@ -294,6 +296,7 @@ test('a profile whose Keychain entry is missing falls back instead of aborting t
   fs.writeFileSync(configPath, JSON.stringify({
     version: 1,
     active_profile: 'alpha',
+    current_model: 'image-2',
     profiles: {
       alpha: {
         base_url: 'https://image.invalid/v1',
@@ -315,7 +318,7 @@ test('a profile whose Keychain entry is missing falls back instead of aborting t
   );
 
   const stub = createMissingKeySecurityStub(t);
-  const result = await runGenerate(['--prompt', 'hello'], home, stub.env);
+  const result = await runGenerate(['--prompt', 'hello', '--allow-profile-fallback'], home, stub.env);
 
   assert.equal(result.code, 1);
   assert.match(result.stderr, /keychain/i);
@@ -365,6 +368,7 @@ test('generate warns that --api-key is visible in the process list', async (t) =
     '--prompt', 'a red apple',
     '--api-key', 'k',
     '--base-url', 'http://127.0.0.1:1/v1',
+    '--out-dir', home,
     '--no-fallback',
   ], home, { OH_COAGE_RETRY_DELAY_MS: '0' });
 
@@ -380,4 +384,178 @@ test('isPrivateOrReservedHost flags loopback/private/metadata hosts', () => {
   for (const host of ['example.com', '8.8.8.8', '1.1.1.1', '172.32.0.1', '11.0.0.1', '']) {
     assert.equal(generate.isPrivateOrReservedHost(host), false, `${host} 不应被误判为本地地址`);
   }
+});
+
+test('POST error classification distinguishes permissions, parameters and uncertain outcomes', () => {
+  const classify = (message) => generate.classifyError(new Error(message), { idempotent: false });
+  for (const message of ['HTTP 503: upstream', 'HTTP 408: timeout', 'socket hang up', 'Request timed out']) {
+    assert.equal(classify(message).resubmittable, false, message);
+    assert.equal(classify(message).fallback, false, message);
+  }
+  assert.equal(classify('HTTP 400: invalid size').fallback, false);
+  assert.equal(classify('HTTP 404: route missing').fallback, false);
+  assert.equal(classify('HTTP 400: model_not_found').kind, 'model');
+  assert.equal(classify('HTTP 403: content_policy_violation').fallback, false);
+  assert.equal(classify('HTTP 403: account disabled').fallback, false);
+  assert.equal(classify('HTTP 403: no access to model').fallback, true);
+  assert.equal(classify('HTTP 429: too many requests').retryable, true);
+});
+
+test('download recovery preserves partial images and resumes without another generation POST', async (t) => {
+  const home = createTempDir();
+  const output = createTempDir();
+  t.after(() => { fs.rmSync(home, { recursive: true, force: true }); fs.rmSync(output, { recursive: true, force: true }); });
+  let posts = 0;
+  let available = false;
+  const server = await startServer((req, res) => {
+    if (req.method === 'POST') {
+      posts += 1;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ data: [{ b64_json: PNG_BASE64 }, { url: `${server.origin}/second.png` }] }));
+    } else if (available) {
+      res.setHeader('content-type', 'image/png'); res.end(Buffer.from(PNG_BASE64, 'base64'));
+    } else { res.writeHead(503); res.end('not ready'); }
+  });
+  t.after(server.close);
+  const first = await runGenerate(['--prompt', 'two apples', '--api-key', 'test', '--base-url', server.baseUrl, '--out-dir', output, '--allow-profile-fallback'], home);
+  assert.equal(first.code, 1);
+  assert.match(first.stderr, /可以继续下载，无需重新生成/);
+  assert.match(first.stderr, /--resume/);
+  assert.match(first.stderr, /已保存图片已保留/);
+  const runDir = fs.readdirSync(output).map((name) => path.join(output, name)).find((entry) => fs.statSync(entry).isDirectory());
+  const recordPath = path.join(runDir, fs.readdirSync(runDir).find((name) => name.startsWith('recovery-')));
+  const record = JSON.parse(fs.readFileSync(recordPath, 'utf8'));
+  assert.equal(record.images.length, 2);
+  assert.ok(fs.existsSync(record.saved[0]));
+  const firstStat = fs.statSync(record.saved[0]).mtimeMs;
+  available = true;
+  const resumed = await runGenerate(['--resume', recordPath, '--json'], home);
+  assert.equal(resumed.code, 0, resumed.stderr);
+  assert.equal(posts, 1);
+  assert.equal(JSON.parse(resumed.stdout).images.length, 2);
+  assert.equal(fs.statSync(record.saved[0]).mtimeMs, firstStat);
+  assert.equal(JSON.parse(fs.readFileSync(recordPath, 'utf8')).status, 'complete');
+});
+
+test('resume of an unknown submission never sends another request', async (t) => {
+  const home = createTempDir();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const recordPath = path.join(home, 'recovery.json');
+  fs.writeFileSync(recordPath, JSON.stringify({ version: 1, baseUrl: 'http://127.0.0.1:1/v1', runDir: home, images: [] }));
+  const result = await runGenerate(['--resume', recordPath], home);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /提交结果未知且没有任务 ID/);
+});
+
+test('an unwritable output target fails before generation submission', async (t) => {
+  const home = createTempDir();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const file = path.join(home, 'not-a-directory');
+  fs.writeFileSync(file, 'existing file');
+  let posts = 0;
+  const server = await startServer((req, res) => { posts += 1; res.end('{}'); });
+  t.after(server.close);
+  const result = await runGenerate(['--prompt', 'test', '--api-key', 'test', '--base-url', server.baseUrl, '--out-dir', file], home);
+  assert.equal(result.code, 1);
+  assert.equal(posts, 0);
+});
+
+test('submission budget bounds retries and model fallback together', async (t) => {
+  const home = createTempDir();
+  const output = createTempDir();
+  t.after(() => { fs.rmSync(home, { recursive: true, force: true }); fs.rmSync(output, { recursive: true, force: true }); });
+  let posts = 0;
+  const server = await startServer((req, res) => { posts += 1; res.writeHead(429); res.end('limited'); });
+  t.after(server.close);
+  const result = await runGenerate(['--prompt', 'apple', '--api-key', 'test', '--base-url', server.baseUrl, '--out-dir', output, '--max-submissions', '1'], home, { OH_COAGE_RETRY_DELAY_MS: '0' });
+  assert.equal(result.code, 1);
+  assert.equal(posts, 1);
+  assert.match(result.stderr, /提交上限 1/);
+});
+
+test('resume polls an existing async task and never submits generation', async (t) => {
+  const home = createTempDir();
+  const output = createTempDir();
+  t.after(() => { fs.rmSync(home, { recursive: true, force: true }); fs.rmSync(output, { recursive: true, force: true }); });
+  const { securityStub } = require('./helpers');
+  const stub = securityStub(t);
+  let posts = 0;
+  let gets = 0;
+  const server = await startServer((req, res) => {
+    if (req.method === 'POST') { posts += 1; res.end('{}'); return; }
+    gets += 1;
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ data: { status: 'completed', result: { data: [{ b64_json: PNG_BASE64 }] } } }));
+  });
+  t.after(server.close);
+  const configPath = path.join(output, 'config.json');
+  fs.writeFileSync(configPath, JSON.stringify({ active_profile: 'main', profiles: { main: { base_url: server.baseUrl, keychain_account: 'main:test' } } }));
+  fs.mkdirSync(path.join(home, '.oh-coage'));
+  fs.writeFileSync(path.join(home, '.oh-coage', 'state.json'), JSON.stringify({ config_path: configPath }));
+  const recordPath = path.join(output, 'recovery.json');
+  fs.writeFileSync(recordPath, JSON.stringify({ version: 1, profile: 'main', baseUrl: server.baseUrl, runDir: output, taskId: 'existing-123', images: [], saved: {} }));
+  const result = await runGenerate(['--resume', recordPath, '--json'], home, stub.env);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(posts, 0);
+  assert.equal(gets, 1);
+  assert.equal(JSON.parse(result.stdout).images.length, 1);
+});
+
+test('a response with fewer images retains results and reports partial without refilling', async (t) => {
+  const home = createTempDir();
+  const output = createTempDir();
+  t.after(() => { fs.rmSync(home, { recursive: true, force: true }); fs.rmSync(output, { recursive: true, force: true }); });
+  let posts = 0;
+  const server = await startServer((req, res) => {
+    posts += 1;
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ data: [{ b64_json: PNG_BASE64 }] }));
+  });
+  t.after(server.close);
+  const result = await runGenerate(['--prompt', 'apples', '--api-key', 'test', '--base-url', server.baseUrl, '--out-dir', output, '--n', '3', '--json'], home);
+  assert.equal(result.code, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.status, 'partial');
+  assert.equal(payload.missing_count, 2);
+  assert.equal(payload.received_count, 1);
+  assert.ok(fs.existsSync(payload.images[0].path));
+  assert.equal(posts, 1);
+});
+
+test('manual-key async recovery queries original task without requiring a saved profile', async (t) => {
+  const home = createTempDir();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  let gets = 0;
+  const server = await startServer((req, res) => {
+    assert.equal(req.method, 'GET');
+    assert.equal(req.headers.authorization, 'Bearer original-key');
+    gets += 1;
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ data: { status: 'completed', result: { data: [{ b64_json: PNG_BASE64 }] } } }));
+  });
+  t.after(server.close);
+  const recordPath = path.join(home, 'recovery.json');
+  fs.writeFileSync(recordPath, JSON.stringify({ version: 1, baseUrl: server.baseUrl, runDir: home, taskId: 'existing', images: [] }));
+  const result = await runGenerate(['--resume', recordPath, '--json'], home, { IMAGES2_GEN_API_KEY: 'original-key' });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(gets, 1);
+  assert.equal(JSON.parse(result.stdout).images.length, 1);
+  assert.ok(!fs.readFileSync(recordPath, 'utf8').includes('original-key'));
+});
+
+test('an incompatible official model blocks before any submission', async (t) => {
+  const output = createTempDir();
+  t.after(() => fs.rmSync(output, { recursive: true, force: true }));
+  let posts = 0;
+  const server = await startServer((req, res) => {
+    posts += 1;
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ data: [{ b64_json: PNG_BASE64 }] }));
+  });
+  t.after(server.close);
+  const models = [{ model: 'gemini-foreign', key: 'foreign', family: 'gemini', source: 'profile' }, { model: 'gpt-image-2', key: 'image2', family: 'openai', source: 'fallback' }];
+  const record = { attempts: [] };
+  await assert.rejects(generate.runCandidate({ name: 'official', family: 'openai', apiStyle: 'official', apiKey: 'test', baseUrl: server.baseUrl, rootOutputDir: output, model: models[0], modelChain: models }, { prompt: 'apple', imageUrls: [], maxSubmissions: 3 }, record), /官方接口协议/);
+  assert.equal(posts, 0);
+  assert.equal(record.submission_count || 0, 0);
 });

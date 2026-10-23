@@ -41,6 +41,9 @@ function assertValidBaseUrl(baseUrl) {
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw new Error(`base_url 仅支持 http/https，当前为 ${parsed.protocol}//`);
   }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error('base_url 不得包含凭据、查询参数或片段。');
+  }
 
   return parsed;
 }
@@ -118,10 +121,15 @@ function resolveProfileOutputDir(profile, configPath) {
 }
 
 function loadConfigFromPath(configPath) {
-  const config = readJson(configPath, null);
+  if (!fs.existsSync(configPath)) return null;
+  const raw = fs.readFileSync(configPath);
+  let config;
+  try { config = JSON.parse(raw); }
+  catch { throw new Error(`无法解析 JSON 配置文件 ${configPath}，请修复文件后重试。`); }
   if (!config) {
     return null;
   }
+  Object.defineProperty(config, '_loadedRevision', { value: crypto.createHash('sha256').update(raw).digest('hex'), writable: true });
 
   config.profiles ||= {};
   for (const profile of Object.values(config.profiles)) {
@@ -171,8 +179,17 @@ function acquireConfigLock(configPath) {
       try {
         const stat = fs.statSync(lockPath);
         if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
-          fs.rmSync(lockPath, { force: true });
-          continue;
+          let alive = true;
+          try {
+            const owner = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+            if (Number.isInteger(owner.pid) && owner.pid > 0) {
+              try { process.kill(owner.pid, 0); } catch (probe) { alive = probe.code !== 'ESRCH'; }
+            } else alive = false;
+          } catch { alive = false; }
+          if (!alive) {
+            fs.rmSync(lockPath, { force: true });
+            continue;
+          }
         }
       } catch {
         continue;
@@ -190,7 +207,13 @@ function acquireConfigLock(configPath) {
   }
 }
 
-function saveConfig(configPath, config) {
+function configRevision(configPath) {
+  return fs.existsSync(configPath)
+    ? crypto.createHash('sha256').update(fs.readFileSync(configPath)).digest('hex')
+    : null;
+}
+
+function saveConfig(configPath, config, expectedRevision) {
   // resolved_root_output_dir 是按配置文件所在位置算出来的派生值，绝不能落盘：
   // 配置文件一旦被搬动（典型场景是放进 iCloud 同步到另一台机器），
   // 过期的绝对路径会盖掉本应重新解析的相对 root_output_dir
@@ -204,9 +227,17 @@ function saveConfig(configPath, config) {
     ),
   };
 
+  ensureParentDir(configPath);
   const release = acquireConfigLock(configPath);
   try {
+    const expected = expectedRevision ? expectedRevision.sha256 : config._loadedRevision;
+    if (expected !== undefined && configRevision(configPath) !== expected) {
+      throw new Error('配置已被其他操作更新，请重新加载后再保存；本次未覆盖已有改动。');
+    }
     writeJson(configPath, persisted);
+    const committedRevision = configRevision(configPath);
+    if (Object.hasOwn(config, '_loadedRevision')) config._loadedRevision = committedRevision;
+    else Object.defineProperty(config, '_loadedRevision', { value: committedRevision, writable: true });
   } finally {
     release();
   }
@@ -261,16 +292,7 @@ function saveKeychainSecret(account, secret) {
     return;
   }
 
-  // 少数环境（没有可用 stdin / tty）下提示式写入会失败，退回 argv 方式，保证初始化不被打断
-  process.stderr.write('提示：当前环境无法通过 stdin 写入密钥，已退回命令行参数方式，该值会短暂出现在进程列表里。\n');
-  const fallback = spawnSync('security', ['add-generic-password', '-U', '-a', account, '-s', KEYCHAIN_SERVICE, '-w', secret], {
-    encoding: 'utf-8',
-  });
-
-  if (fallback.status !== 0) {
-    const stderr = fallback.stderr || prompted.stderr;
-    throw new Error(formatKeychainError('write', stderr) || '写入 Keychain 失败');
-  }
+  throw new Error(formatKeychainError('write', prompted.stderr) || '无法安全写入 Keychain，请解锁钥匙串后重试；密钥未通过命令行参数传递。');
 }
 
 function readKeychainSecret(account) {
@@ -341,6 +363,7 @@ module.exports = {
   loadActiveConfig,
   resolveProfileOutputDir,
   saveConfig,
+  configRevision,
   acquireConfigLock,
   buildKeychainAccount,
   saveKeychainSecret,

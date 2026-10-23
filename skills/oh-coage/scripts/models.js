@@ -14,6 +14,7 @@ const {
 } = require('./providers');
 
 const DEFAULT_MODEL_KEY = 'image-2';
+const { inferModelFamily } = require('./family-config');
 
 // 保持旧导出的语义：BUILTIN_MODELS 只含默认的 OpenAI 兼容模型。
 // 全量列表用 ALL_BUILTIN_MODELS，避免旧测试和旧调用方被新族模型撑破。
@@ -129,8 +130,10 @@ function finishResolved(entry, source) {
  * 把用户输入（短名、family:短名或原始 model ID）解析成实际要发给接口的模型。
  * 无法识别或跨族多义时抛错，避免把错误 ID 发到接口白烧配额。
  */
-function resolveModel(input, configOrCustomModels, family) {
-  const catalog = buildModelCatalog(configOrCustomModels, family);
+function resolveModel(input, configOrCustomModels, family, allFamilies = false) {
+  const catalog = allFamilies
+    ? ['openai', 'gemini', 'grok'].flatMap(value => buildModelCatalog(configOrCustomModels, value))
+    : buildModelCatalog(configOrCustomModels, family);
   const raw = normalizeModelInput(input);
 
   if (!raw) {
@@ -207,7 +210,7 @@ function resolveConfiguredModel(config, family) {
  *   --model（本次显式指定） > profile.model（该 profile 固定） > config.current_model > 该族默认
  */
 function resolveModelForProfile({ cliModelEntry, profileModelKey, config, family } = {}) {
-  const resolvedFamily = normalizeFamily(family || 'openai');
+  const resolvedFamily = family === 'other' ? 'other' : normalizeFamily(family || 'openai');
 
   if (cliModelEntry) {
     if (cliModelEntry.family !== resolvedFamily) {
@@ -223,6 +226,89 @@ function resolveModelForProfile({ cliModelEntry, profileModelKey, config, family
   return resolveConfiguredModel(config, resolvedFamily);
 }
 
+/**
+ * 解析一个 profile 内部的主备模型链：
+ *   [首选, 备用1, 备用2, ...]
+ *
+ * 主备都写进**同一个 profile**，因为站点、Key、协议、输出目录完全一样，
+ * 只是模型不同。这样失败时不需要再造一个 profile 就能换模型重试。
+ *
+ * 规则：
+ *   - --model 显式指定 = 只用它，不参与主备（用户点名了就照办）
+ *   - 首选：profile.model > config.current_model > 该族默认
+ *   - 备用：profile.fallback_models，按写入顺序
+ *   - 备用里解析失败（写错、已被删除）只跳过该条并告警，不中断整轮
+ *   - 按 model ID 去重，避免同一个模型被重复尝试、重复计费
+ *
+ * @param {{cliModelEntry?: object|null, profileModelKey?: string|null, profileFallbackKeys?: string[], config?: object, family?: string, allowModelFallback?: boolean, warn?: (message: string) => void}} options
+ */
+function resolveModelChainForProfile({
+  cliModelEntry,
+  profileModelKey,
+  profileFallbackKeys,
+  profile,
+  config,
+  family,
+  allowModelFallback = true,
+  warn = () => {},
+} = {}) {
+  const resolvedFamily = family === 'other' ? 'other' : normalizeFamily(family || 'openai');
+
+  if (cliModelEntry) {
+    return [{ ...cliModelEntry, source: 'cli' }];
+  }
+
+  const chain = [];
+  const resolveSaved = (key) => {
+    const ids = [...(profile?.synced_models || []), ...(profile?.manual_models || [])]
+      .map(row => typeof row === 'string' ? row : row?.id || row?.model);
+    if (ids.length) return resolveProfileModel(key, profile, config);
+    const entry = resolveModel(key, config, null, true);
+    if (profile && !entry.builtin) throw new Error(`模型 ${key} 未在此配置的当前模型列表或手动模型中验证，请刷新模型列表或重新添加准确 ID。`);
+    return entry;
+  };
+  const push = (entry) => {
+    if (!entry) return false;
+    if (chain.some((item) => item.model === entry.model)) return false;
+    chain.push(entry);
+    return true;
+  };
+
+  try {
+    push(profileModelKey
+      ? { ...resolveSaved(profileModelKey), source: 'profile' }
+      : resolveConfiguredModel(config, resolvedFamily));
+  } catch (error) {
+    if (!allowModelFallback) throw error;
+    warn(`跳过首选模型 ${profileModelKey || ''}：${error.message.split('\n')[0]}`);
+  }
+
+  if (!allowModelFallback) {
+    return chain;
+  }
+
+  const fallbackKeys = Array.isArray(profileFallbackKeys) ? profileFallbackKeys : [];
+  const backup = fallbackKeys.find(key => key && key !== profileModelKey);
+  for (const key of backup ? [backup] : []) {
+    if (!key) continue;
+    try {
+      const entry = { ...resolveSaved(key), source: 'fallback' };
+      if (inferModelFamily(entry.model, profile, config) !== (family === 'other' ? 'other' : resolvedFamily)) {
+        warn(`备用模型 ${key} 不属于当前厂家，已跳过；请重新配置主备模型。`);
+        continue;
+      }
+      if (!push(entry)) {
+        warn(`备用模型 ${key} 与已选模型重复（${entry.model}），已跳过。`);
+      }
+    } catch (error) {
+      warn(`跳过备用模型 ${key}：${error.message.split('\n')[0]}`);
+    }
+  }
+
+  if (!chain.length) throw new Error('当前配置没有可用的已保存模型，请刷新列表并修改主备模型。');
+  return chain;
+}
+
 /** --profile-model 接受这些值表示「取消固定，跟随全局当前模型」。 */
 function isClearModelInput(value) {
   return ['none', 'default', 'clear', 'auto'].includes(normalizeModelInput(value));
@@ -231,6 +317,24 @@ function isClearModelInput(value) {
 function isBuiltinModelKey(key) {
   const raw = normalizeModelInput(key);
   return ALL_BUILTIN_MODELS.some((entry) => normalizeModelInput(entry.key) === raw);
+}
+
+/** Resolve conversational names against this site's actual IDs, not another site's catalog. */
+function resolveProfileModel(input, profile, config) {
+  const ids = [...new Set([...(profile?.synced_models || []), ...(profile?.manual_models || [])]
+    .map(row => typeof row === 'string' ? row : row?.id || row?.model).filter(Boolean))];
+  if (!ids.length) return resolveModel(input, config, null, true);
+  const raw = normalizeModelInput(input);
+  const exact = ids.filter(id => normalizeModelInput(id) === raw);
+  const matches = exact.length ? exact : ids.filter(id => normalizeModelInput(id).includes(raw));
+  if (!raw || matches.length !== 1) {
+    throw new Error(matches.length > 1
+      ? `\`${input}\` 对应多个站点模型，请明确选择：${matches.join('、')}`
+      : `当前站点列表中没有模型 \`${input}\`，请刷新模型列表或切换配置。`);
+  }
+  const model = matches[0];
+  const family = inferModelFamily(model, profile, config);
+  return { key: model, model, family, builtin: false, source: 'profile-catalog' };
 }
 
 module.exports = {
@@ -242,7 +346,9 @@ module.exports = {
   resolveModel,
   resolveConfiguredModel,
   resolveModelForProfile,
+  resolveModelChainForProfile,
   isClearModelInput,
   isBuiltinModelKey,
   normalizeModelInput,
+  resolveProfileModel,
 };

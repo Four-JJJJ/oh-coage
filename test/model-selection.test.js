@@ -394,7 +394,7 @@ test('a profile-pinned model wins over the global one, and --model overrides bot
   assert.equal(ctx.readConfig().profiles.main.model, 'image-2.5-sunburst', '--model 不应改动 profile');
 });
 
-test('a profile pinned to an unknown model is skipped instead of aborting the run', async (t) => {
+test('an unverified legacy unknown model is preserved but skipped at runtime', async (t) => {
   const stub = createSecurityStub(t);
   const bodies = [];
   const server = await startImageServer(bodies);
@@ -424,13 +424,14 @@ test('a profile pinned to an unknown model is skipped instead of aborting the ru
 
   const result = await runNode(generatePath, [
     '--prompt', 'a red apple',
+    '--allow-profile-fallback',
     '--out-dir', outputDir,
   ], ctx.home, stub.env);
 
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stderr, /跳过 profile=broken/);
   assert.match(result.stderr, /未知模型/);
-  assert.equal(bodies.at(-1).model, 'gpt-image-2', '应回退到下一个 profile 并跟随全局模型');
+  assert.equal(bodies.at(-1).model, 'gpt-image-2');
 });
 
 test('generate warns when --base-url overrides the site but still uses the Keychain key', async (t) => {
